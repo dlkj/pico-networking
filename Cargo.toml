@@ -1,29 +1,25 @@
 [package]
 edition = "2021"
-name = "rp2040-project-template"
+name = "pico-networking"
 version = "0.1.0"
+description = "HAL based networking examples for the Raspberry Pi Pico, Pico-W, RP2040"
+license = "MIT"
+repository = "https://github.com/dlkj/pico-networking"
+keywords = ["pico", "rp2040", "network", "wifi", "ethernet"]
+categories = ["no-std", "embedded"]
+authors = ["DLKJ"]
+homepage = "https://github.com/dlkj/pico-networking"
 
 [dependencies]
 cortex-m = "0.7"
 cortex-m-rt = "0.7"
 embedded-hal = { version = "0.2.5", features = ["unproven"] }
 
-# Versions >0.3.4 contain a breaking change (wire format 4) and version 0.3.3 is yanked,
-# so we need to force version 0.3.2 for now to be compatible with the latest
-# working version of probe-run.
-defmt = "=0.3.2"
+defmt = "0.3"
 defmt-rtt = "0.4"
 panic-probe = { version = "0.3", features = ["print-defmt"] }
 
-# We're using a Pico by default on this template
 rp-pico = "0.7"
-
-# but you can use any BSP. Uncomment this to use the pro_micro_rp2040 BSP instead
-# sparkfun-pro-micro-rp2040 = "0.6"
-
-# If you're not going to use a Board Support Package you'll need these:
-# rp2040-hal = { version="0.8", features=["rt", "critical-section-impl"] }
-# rp2040-boot2 = "0.2"
 
 # cargo build/run
 [profile.dev]

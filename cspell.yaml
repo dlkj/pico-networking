@@ -1,0 +1,15 @@
+version: 0.2
+dictionaries:
+  - softwareTerms
+words:
+  - defmt
+  - eabi
+  - gpio
+  - pico
+  - plls
+  - println
+  - rustc
+  - rustup
+  - thumbv
+  - XOSC
+  - xtal
