@@ -3,13 +3,18 @@ dictionaries:
   - softwareTerms
 words:
   - defmt
+  - DPRAM
   - eabi
   - gpio
   - pico
   - plls
   - println
+  - REGS
   - rustc
   - rustup
   - thumbv
+  - Toggleable
+  - USBCTRL
+  - usbd
   - XOSC
   - xtal

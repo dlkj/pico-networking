@@ -1,6 +1,3 @@
-//! Blinks the LED on a Pico board
-//!
-//! This will blink an LED attached to GP25, which is the pin the Pico uses for the on-board LED.
 #![no_std]
 #![no_main]
 #![warn(clippy::pedantic)]
@@ -13,32 +10,35 @@
 #![warn(clippy::use_self)]
 
 use bsp::entry;
+use bsp::hal;
 use defmt::{info, warn};
 use defmt_rtt as _;
-use embedded_hal::digital::v2::OutputPin;
-use panic_probe as _;
-
-use rp_pico as bsp;
-
-use bsp::hal::{
-    clocks::{init_clocks_and_plls, Clock},
+use embedded_hal::digital::v2::ToggleableOutputPin;
+use hal::{
+    clocks::init_clocks_and_plls,
+    gpio::{bank0::Gpio25, Output, Pin, PushPull},
     pac,
     sio::Sio,
     watchdog::Watchdog,
 };
+use panic_probe as _;
+use rp_pico as bsp;
+#[allow(clippy::wildcard_imports)]
+use usb_device::class_prelude::*;
+use usb_device::prelude::*;
+use usbd_serial::SerialPort;
+
+mod usbd_ethernet;
 
 #[entry]
 fn main() -> ! {
     info!("Program start");
     let mut pac = pac::Peripherals::take().unwrap();
-    let core = pac::CorePeripherals::take().unwrap();
     let mut watchdog = Watchdog::new(pac.WATCHDOG);
     let sio = Sio::new(pac.SIO);
 
-    // External high-speed crystal on the pico board is 12Mhz
-    let external_xtal_freq_hz = 12_000_000u32;
     let clocks = init_clocks_and_plls(
-        external_xtal_freq_hz,
+        bsp::XOSC_CRYSTAL_FREQ,
         pac.XOSC,
         pac.CLOCKS,
         pac.PLL_SYS,
@@ -49,8 +49,6 @@ fn main() -> ! {
     .ok()
     .unwrap();
 
-    let mut delay = cortex_m::delay::Delay::new(core.SYST, clocks.system_clock.freq().to_Hz());
-
     let pins = bsp::Pins::new(
         pac.IO_BANK0,
         pac.PADS_BANK0,
@@ -60,12 +58,66 @@ fn main() -> ! {
 
     let mut led_pin = pins.led.into_push_pull_output();
 
+    let usb_alloc = UsbBusAllocator::new(hal::usb::UsbBus::new(
+        pac.USBCTRL_REGS,
+        pac.USBCTRL_DPRAM,
+        clocks.usb_clock,
+        true,
+        &mut pac.RESETS,
+    ));
+
+    let mut serial = SerialPort::new(&usb_alloc);
+
+    let mut usb_dev = UsbDeviceBuilder::new(&usb_alloc, UsbVidPid(0x1209, 0x0004))
+        .manufacturer("pico-networking")
+        .product("usb-ethernet")
+        .serial_number("TEST")
+        .device_class(2) // Communications and CDC Control
+        .build();
+
     loop {
-        info!("on!");
-        led_pin.set_high().unwrap();
-        delay.delay_ms(500);
-        info!("off!");
-        led_pin.set_low().unwrap();
-        delay.delay_ms(500);
+        if usb_dev.poll(&mut [&mut serial]) {
+            poll_serial(&mut serial, &mut led_pin);
+        }
+    }
+}
+
+fn poll_serial(
+    serial: &mut SerialPort<hal::usb::UsbBus>,
+    led_pin: &mut Pin<Gpio25, Output<PushPull>>,
+) {
+    let mut buf = [0u8; 64];
+    match serial.read(&mut buf) {
+        Err(_e) => {}
+        Ok(count) => {
+            info!("rxd {:02x}", &buf[..count]);
+
+            // Toggle led if received 'a'
+            if buf.contains(&b'a') {
+                info!("toggle led");
+                led_pin.toggle().unwrap();
+            }
+
+            // Convert to upper case
+            buf.iter_mut().take(count).for_each(|b| {
+                b.make_ascii_uppercase();
+            });
+
+            // Send back to the host
+            let mut wr_ptr = &buf[..count];
+            while !wr_ptr.is_empty() {
+                match serial.write(wr_ptr) {
+                    Ok(len) => {
+                        info!("txd {:02x}", &wr_ptr[..len]);
+                        wr_ptr = &wr_ptr[len..];
+                    }
+
+                    Err(e) => {
+                        warn!("write error: {:?}", e);
+                        break;
+                    }
+                };
+            }
+        }
     }
 }
