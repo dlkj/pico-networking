@@ -26,7 +26,10 @@ use rp_pico as bsp;
 #[allow(clippy::wildcard_imports)]
 use usb_device::class_prelude::*;
 use usb_device::prelude::*;
-use usbd_serial::SerialPort;
+
+use crate::usbd_ethernet::cdc_ncm::CdcNcmClass;
+use crate::usbd_ethernet::cdc_ncm::State;
+use crate::usbd_ethernet::cdc_ncm::USB_CLASS_CDC;
 
 mod usbd_ethernet;
 
@@ -66,28 +69,34 @@ fn main() -> ! {
         &mut pac.RESETS,
     ));
 
-    let mut serial = SerialPort::new(&usb_alloc);
+    let host_mac_addr = [0x88, 0x88, 0x88, 0x88, 0x88, 0x88];
+
+    let mut cdc_ncm = CdcNcmClass::new(&usb_alloc, host_mac_addr, 64);
 
     let mut usb_dev = UsbDeviceBuilder::new(&usb_alloc, UsbVidPid(0x1209, 0x0004))
         .manufacturer("pico-networking")
         .product("usb-ethernet")
         .serial_number("TEST")
-        .device_class(2) // Communications and CDC Control
+        .device_class(USB_CLASS_CDC)
         .build();
 
     loop {
-        if usb_dev.poll(&mut [&mut serial]) {
-            poll_serial(&mut serial, &mut led_pin);
+        if usb_dev.poll(&mut [&mut cdc_ncm]) {
+            poll(&mut cdc_ncm, &mut led_pin);
         }
+
+        // if cdc_ncm.state() == State::Configured {
+        //     cdc_ncm.connect().ok();
+        // }
     }
 }
 
-fn poll_serial(
-    serial: &mut SerialPort<hal::usb::UsbBus>,
+fn poll(
+    cdc_ncm: &mut CdcNcmClass<'_, hal::usb::UsbBus>,
     led_pin: &mut Pin<Gpio25, Output<PushPull>>,
 ) {
     let mut buf = [0u8; 64];
-    match serial.read(&mut buf) {
+    match cdc_ncm.read_packet(&mut buf) {
         Err(_e) => {}
         Ok(count) => {
             info!("rxd {:02x}", &buf[..count]);
@@ -104,20 +113,20 @@ fn poll_serial(
             });
 
             // Send back to the host
-            let mut wr_ptr = &buf[..count];
-            while !wr_ptr.is_empty() {
-                match serial.write(wr_ptr) {
-                    Ok(len) => {
-                        info!("txd {:02x}", &wr_ptr[..len]);
-                        wr_ptr = &wr_ptr[len..];
-                    }
+            // let mut wr_ptr = &buf[..count];
+            // while !wr_ptr.is_empty() {
+            //     match cdcNcm.write_packet(wr_ptr) {
+            //         Ok(len) => {
+            //             info!("txd {:02x}", &wr_ptr[..len]);
+            //             wr_ptr = &wr_ptr[len..];
+            //         }
 
-                    Err(e) => {
-                        warn!("write error: {:?}", e);
-                        break;
-                    }
-                };
-            }
+            //         Err(e) => {
+            //             warn!("write error: {:?}", e);
+            //             break;
+            //         }
+            //     };
+            // }
         }
     }
 }

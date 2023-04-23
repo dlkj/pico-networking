@@ -16,13 +16,14 @@ cortex-m-rt = "0.7"
 embedded-hal = { version = "0.2.5", features = ["unproven"] }
 
 usb-device = { version = "0.2", features = ["defmt"] }
+heapless = { version = "0.7", features = ["defmt-impl"] }
 
 defmt = "0.3"
 defmt-rtt = "0.4"
 panic-probe = { version = "0.3", features = ["print-defmt"] }
 
 rp-pico = { version = "0.7", features = ["rp2040-e5", "rom-v2-intrinsics"] }
-usbd-serial = "0.1.1"
+
 
 # cargo build/run
 [profile.dev]

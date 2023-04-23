@@ -2,19 +2,22 @@ version: 0.2
 dictionaries:
   - softwareTerms
 words:
+  - DATAGRAM
   - defmt
-  - DPRAM
+  - dpram
   - eabi
   - gpio
+  - heapless
+  - NOTIF
   - pico
   - plls
   - println
-  - REGS
+  - regs
   - rustc
   - rustup
   - thumbv
-  - Toggleable
-  - USBCTRL
+  - toggleable
+  - usbctrl
   - usbd
-  - XOSC
+  - xosc
   - xtal
