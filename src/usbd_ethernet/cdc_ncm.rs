@@ -1,6 +1,6 @@
 use core::cell::Cell;
 
-use defmt::{debug, warn, Format};
+use defmt::{debug, error, warn, Format};
 use heapless::String;
 #[allow(clippy::wildcard_imports)]
 use usb_device::class_prelude::*;
@@ -20,6 +20,8 @@ const CDC_TYPE_HEADER: u8 = 0x00;
 const CDC_TYPE_UNION: u8 = 0x06;
 const CDC_TYPE_ETHERNET: u8 = 0x0F;
 const CDC_TYPE_NCM: u8 = 0x1A;
+
+const REQ_SET_INTERFACE: u8 = 11;
 
 const REQ_SEND_ENCAPSULATED_COMMAND: u8 = 0x00;
 //const REQ_GET_ENCAPSULATED_COMMAND: u8 = 0x01;
@@ -53,13 +55,14 @@ pub enum State {
     #[default]
     Init,
     Configured,
-    Enabled,
+    Connected,
 }
 
 pub struct CdcNcmClass<'a, B: UsbBus> {
     comm_if: InterfaceNumber,
     comm_ep: EndpointIn<'a, B>,
     data_if: InterfaceNumber,
+    data_if_enabled: bool,
     read_ep: EndpointOut<'a, B>,
     write_ep: EndpointIn<'a, B>,
     mac_address: String<12>,
@@ -86,6 +89,7 @@ impl<'a, B: UsbBus> CdcNcmClass<'a, B> {
             comm_if: alloc.interface(),
             comm_ep: alloc.interrupt(8, 255),
             data_if: alloc.interface(),
+            data_if_enabled: false,
             read_ep: alloc.bulk(max_packet_size),
             write_ep: alloc.bulk(max_packet_size),
             mac_address: s,
@@ -94,29 +98,29 @@ impl<'a, B: UsbBus> CdcNcmClass<'a, B> {
         }
     }
 
-    /// Gets the maximum packet size in bytes.
-    pub fn max_packet_size(&self) -> u16 {
-        // The size is the same for both endpoints.
-        self.read_ep.max_packet_size()
-    }
+    // /// Gets the maximum packet size in bytes.
+    // pub fn max_packet_size(&self) -> u16 {
+    //     // The size is the same for both endpoints.
+    //     self.read_ep.max_packet_size()
+    // }
 
-    /// Writes a single packet into the IN endpoint.
-    pub fn write_packet(&mut self, data: &[u8]) -> Result<usize> {
-        self.write_ep.write(data)
-    }
+    // /// Writes a single packet into the IN endpoint.
+    // pub fn write_packet(&mut self, data: &[u8]) -> Result<usize> {
+    //     self.write_ep.write(data)
+    // }
 
     /// Reads a single packet from the OUT endpoint.
     pub fn read_packet(&mut self, data: &mut [u8]) -> Result<usize> {
         self.read_ep.read(data)
     }
 
-    /// Gets the address of the IN endpoint.
-    pub(crate) fn write_ep_address(&self) -> EndpointAddress {
-        self.write_ep.address()
-    }
+    // /// Gets the address of the IN endpoint.
+    // pub(crate) fn write_ep_address(&self) -> EndpointAddress {
+    //     self.write_ep.address()
+    // }
 
     pub fn connect(&mut self) -> Result<usize> {
-        let result = self.write_packet(&[
+        let result = self.comm_ep.write(&[
             0xA1, //bmRequestType
             0x00, //bNotificationType = NETWORK_CONNECTION
             0x01, // wValue = connected
@@ -129,7 +133,7 @@ impl<'a, B: UsbBus> CdcNcmClass<'a, B> {
 
         if result.is_ok() && self.state.get_mut() == &State::Configured {
             debug!("Sent connect - enabled");
-            *self.state.get_mut() = State::Enabled;
+            *self.state.get_mut() = State::Connected;
         }
 
         result
@@ -138,11 +142,14 @@ impl<'a, B: UsbBus> CdcNcmClass<'a, B> {
     pub fn state(&self) -> State {
         self.state.get()
     }
+
+    pub fn data_if_enabled(&self) -> bool {
+        self.data_if_enabled
+    }
 }
 
 impl<B: UsbBus> UsbClass<B> for CdcNcmClass<'_, B> {
     fn get_configuration_descriptors(&self, writer: &mut DescriptorWriter) -> Result<()> {
-        debug!("get_configuration_descriptors start");
         writer.iad(
             self.comm_if,
             2,
@@ -230,9 +237,8 @@ impl<B: UsbBus> UsbClass<B> for CdcNcmClass<'_, B> {
         writer.endpoint(&self.write_ep)?;
         writer.endpoint(&self.read_ep)?;
 
-        debug!("get_configuration_descriptors done");
+        debug!("get_configuration_descriptors sent");
         if self.state.get() == State::Init {
-            debug!("Configured");
             self.state.set(State::Configured);
         }
 
@@ -275,8 +281,6 @@ impl<B: UsbBus> UsbClass<B> for CdcNcmClass<'_, B> {
 
         match req.request {
             REQ_GET_NTB_PARAMETERS => {
-                debug!("control_in REQ_GET_NTB_PARAMETERS");
-
                 transfer
                     .accept(|data| {
                         data[0..2].copy_from_slice(&28u16.to_le_bytes()); // length
@@ -313,9 +317,19 @@ impl<B: UsbBus> UsbClass<B> for CdcNcmClass<'_, B> {
             )
         {
             match req.request {
-                11 => {
-                    debug!("data interface set alternate setting {}", req.value);
-                    transfer.accept().ok();
+                REQ_SET_INTERFACE => {
+                    if req.value == 0 {
+                        debug!("data interface disabled");
+                        self.data_if_enabled = false;
+                        transfer.accept().ok();
+                    } else if req.value == 1 {
+                        debug!("data interface enabled");
+                        self.data_if_enabled = true;
+                        transfer.accept().ok();
+                    } else {
+                        error!("SET_INTERFACE out of range {}", req.request);
+                        transfer.reject().ok();
+                    }
                 }
                 _ => {
                     debug!(
@@ -364,10 +378,7 @@ impl<B: UsbBus> UsbClass<B> for CdcNcmClass<'_, B> {
     }
 
     fn get_string(&self, index: StringIndex, _lang_id: u16) -> Option<&str> {
-        debug!("get_string");
-
         if index == self.mac_address_idx {
-            debug!("mac: {:?}", self.mac_address);
             Some(&self.mac_address)
         } else {
             warn!("unknown string index requested");

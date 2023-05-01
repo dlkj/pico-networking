@@ -85,9 +85,9 @@ fn main() -> ! {
             poll(&mut cdc_ncm, &mut led_pin);
         }
 
-        // if cdc_ncm.state() == State::Configured {
-        //     cdc_ncm.connect().ok();
-        // }
+        if cdc_ncm.state() == State::Configured && cdc_ncm.data_if_enabled() {
+            cdc_ncm.connect().ok();
+        }
     }
 }
 
