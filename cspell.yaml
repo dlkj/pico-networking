@@ -2,12 +2,14 @@ version: 0.2
 dictionaries:
   - softwareTerms
 words:
+  - addrs
   - DATAGRAM
   - defmt
   - dpram
   - eabi
   - gpio
   - heapless
+  - iface
   - NOTIF
   - pico
   - plls
@@ -15,6 +17,7 @@ words:
   - regs
   - rustc
   - rustup
+  - smoltcp
   - thumbv
   - toggleable
   - usbctrl
