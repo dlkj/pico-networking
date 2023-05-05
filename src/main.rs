@@ -95,7 +95,7 @@ fn poll(
     cdc_ncm: &mut CdcNcmClass<'_, hal::usb::UsbBus>,
     led_pin: &mut Pin<Gpio25, Output<PushPull>>,
 ) {
-    let mut buf = [0u8; 64];
+    let mut buf = [0u8; 2048];
     match cdc_ncm.read_packet(&mut buf) {
         Err(_e) => {}
         Ok(count) => {

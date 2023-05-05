@@ -1,7 +1,7 @@
-use core::cell::Cell;
+use core::{cell::Cell, char::MAX, mem::size_of, ptr::copy_nonoverlapping};
 
 use defmt::{debug, error, warn, Format};
-use heapless::String;
+use heapless::{String, Vec};
 #[allow(clippy::wildcard_imports)]
 use usb_device::class_prelude::*;
 use usb_device::{control::RequestType, Result};
@@ -45,10 +45,10 @@ const REQ_SET_NTB_INPUT_SIZE: u8 = 0x86;
 //const NOTIF_MAX_PACKET_SIZE: u16 = 8;
 //const NOTIF_POLL_INTERVAL: u8 = 20;
 
-const NTB_MAX_SIZE: u32 = 2048;
-// const SIG_NTH: u32 = 0x484d_434e;
-// const SIG_NDP_NO_FCS: u32 = 0x304d_434e;
-// const SIG_NDP_WITH_FCS: u32 = 0x314d_434e;
+const NTB_MAX_SIZE: usize = 2048;
+const SIG_NTH: u32 = 0x484d_434e;
+const SIG_NDP_NO_FCS: u32 = 0x304d_434e;
+const SIG_NDP_WITH_FCS: u32 = 0x314d_434e;
 
 #[derive(Default, Format, PartialEq, Eq, Clone, Copy)]
 pub enum State {
@@ -68,6 +68,38 @@ pub struct CdcNcmClass<'a, B: UsbBus> {
     mac_address: String<12>,
     mac_address_idx: StringIndex,
     state: Cell<State>,
+    read_ntb_buffer: [u8; NTB_MAX_SIZE],
+    read_ntb_size: usize,
+    write_ntb_buffer: Vec<u8, NTB_MAX_SIZE>,
+    write_ntb_sent: usize,
+    seq: u16,
+}
+
+/// Simple NTB header (NTH+NDP all in one) for sending packets
+#[repr(packed)]
+#[allow(unused)]
+struct NtbOutHeader {
+    // NTH
+    nth_sig: u32,
+    nth_len: u16,
+    nth_seq: u16,
+    nth_total_len: u16,
+    nth_first_index: u16,
+
+    // NDP
+    ndp_sig: u32,
+    ndp_len: u16,
+    ndp_next_index: u16,
+    ndp_datagram_index: u16,
+    ndp_datagram_len: u16,
+    ndp_term1: u16,
+    ndp_term2: u16,
+}
+
+fn byteify<T>(buf: &mut [u8], data: T) -> &[u8] {
+    let len = size_of::<T>();
+    unsafe { copy_nonoverlapping(&data as *const _ as *const u8, buf.as_mut_ptr(), len) }
+    &buf[..len]
 }
 
 impl<'a, B: UsbBus> CdcNcmClass<'a, B> {
@@ -95,6 +127,11 @@ impl<'a, B: UsbBus> CdcNcmClass<'a, B> {
             mac_address: s,
             mac_address_idx,
             state: Cell::default(),
+            read_ntb_buffer: [0; NTB_MAX_SIZE],
+            read_ntb_size: 0,
+            write_ntb_buffer: Vec::default(),
+            write_ntb_sent: 0,
+            seq: 0,
         }
     }
 
@@ -104,14 +141,156 @@ impl<'a, B: UsbBus> CdcNcmClass<'a, B> {
     //     self.read_ep.max_packet_size()
     // }
 
-    // /// Writes a single packet into the IN endpoint.
-    // pub fn write_packet(&mut self, data: &[u8]) -> Result<usize> {
-    //     self.write_ep.write(data)
-    // }
+    /// Writes a single packet into the IN endpoint.
+    pub fn write_packet(&mut self, data: &[u8]) -> Result<usize> {
+        const OUT_HEADER_LEN: usize = 28;
+        const MAX_PACKET_SIZE: usize = 64; // TODO unhardcode
+
+        if self.write_ntb_buffer.is_empty() {
+            let seq = self.seq;
+            self.seq = self.seq.wrapping_add(1);
+
+            let header = NtbOutHeader {
+                nth_sig: SIG_NTH,
+                nth_len: 0x0c,
+                nth_seq: seq,
+                nth_total_len: (data.len() + OUT_HEADER_LEN) as u16,
+                nth_first_index: 0x0c,
+
+                ndp_sig: SIG_NDP_NO_FCS,
+                ndp_len: 0x10,
+                ndp_next_index: 0x00,
+                ndp_datagram_index: OUT_HEADER_LEN as u16,
+                ndp_datagram_len: data.len() as u16,
+                ndp_term1: 0x00,
+                ndp_term2: 0x00,
+            };
+
+            let mut buf = [0; MAX_PACKET_SIZE];
+            let n = byteify(&mut buf, header);
+            assert_eq!(n.len(), OUT_HEADER_LEN);
+
+            if OUT_HEADER_LEN + data.len() < MAX_PACKET_SIZE {
+                // First packet is not full, just send it.
+                // No need to send ZLP because it's short for sure.
+                buf[OUT_HEADER_LEN..][..data.len()].copy_from_slice(data);
+                self.write_ep.write(&buf[..OUT_HEADER_LEN + data.len()])?;
+            } else {
+                if data.len() > self.write_ntb_buffer.capacity() {
+                    return Err(UsbError::BufferOverflow);
+                }
+                let (d1, d2) = data.split_at(MAX_PACKET_SIZE - OUT_HEADER_LEN);
+
+                buf[OUT_HEADER_LEN..].copy_from_slice(d1);
+                match self.write_ep.write(&buf) {
+                    Ok(_) => {
+                        self.write_ntb_buffer
+                            .extend_from_slice(d2)
+                            .map_err(|_| UsbError::BufferOverflow)?;
+
+                        self.write_ntb_sent = 0;
+                    }
+                    Err(e) => {
+                        return Err(e);
+                    }
+                }
+            }
+            return Ok(data.len());
+        }
+
+        // TODO replace write_ntb_sent with slice
+
+        // ZLP if % MAX_PACKET_SIZE
+        if self.write_ntb_sent == self.write_ntb_buffer.len() {
+            self.write_ep.write(&[])?;
+            // TODO Handle errors
+            self.write_ntb_sent = 0;
+            self.write_ntb_buffer.clear();
+            return Err(UsbError::WouldBlock);
+        }
+        // Full packet
+        else if self.write_ntb_buffer.len() - self.write_ntb_sent >= MAX_PACKET_SIZE {
+            self.write_ep
+                .write(&self.write_ntb_buffer[self.write_ntb_sent..MAX_PACKET_SIZE])?;
+            // TODO Handle errors
+            self.write_ntb_sent += MAX_PACKET_SIZE;
+            return Err(UsbError::WouldBlock);
+        }
+        // Short packet
+        self.write_ep
+            .write(&self.write_ntb_buffer[self.write_ntb_sent..])?;
+        self.write_ntb_buffer.clear();
+        self.write_ntb_sent = 0;
+        Err(UsbError::WouldBlock)
+    }
 
     /// Reads a single packet from the OUT endpoint.
     pub fn read_packet(&mut self, data: &mut [u8]) -> Result<usize> {
-        self.read_ep.read(data)
+        let n = self
+            .read_ep
+            .read(&mut self.read_ntb_buffer[self.read_ntb_size..])?;
+        self.read_ntb_size += n;
+
+        if n == usize::from(self.read_ep.max_packet_size()) && self.read_ntb_size <= NTB_MAX_SIZE {
+            return Err(UsbError::WouldBlock);
+        }
+
+        let ntb = &self.read_ntb_buffer[..self.read_ntb_size];
+
+        // Process NTB header (NTH)
+        let nth = match ntb.get(..12) {
+            Some(x) => x,
+            None => {
+                warn!("Received too short NTB");
+                self.read_ntb_size = 0;
+                return Err(UsbError::ParseError);
+            }
+        };
+        let sig = u32::from_le_bytes(nth[0..4].try_into().unwrap());
+        if sig != SIG_NTH {
+            warn!("Received bad NTH sig.");
+            self.read_ntb_size = 0;
+            return Err(UsbError::ParseError);
+        }
+        let ndp_idx = u16::from_le_bytes(nth[10..12].try_into().unwrap()) as usize;
+
+        // Process NTB Datagram Pointer (NDP)
+        let ndp = match ntb.get(ndp_idx..ndp_idx + 12) {
+            Some(x) => x,
+            None => {
+                warn!("NTH has an NDP pointer out of range.");
+                self.read_ntb_size = 0;
+                return Err(UsbError::ParseError);
+            }
+        };
+        let sig = u32::from_le_bytes(ndp[0..4].try_into().unwrap());
+        if sig != SIG_NDP_NO_FCS && sig != SIG_NDP_WITH_FCS {
+            warn!("Received bad NDP sig.");
+            self.read_ntb_size = 0;
+            return Err(UsbError::ParseError);
+        }
+        let datagram_index = u16::from_le_bytes(ndp[8..10].try_into().unwrap()) as usize;
+        let datagram_len = u16::from_le_bytes(ndp[10..12].try_into().unwrap()) as usize;
+
+        if datagram_index == 0 || datagram_len == 0 {
+            // empty, ignore. This is allowed by the spec, so don't warn.
+            self.read_ntb_size = 0;
+            return Err(UsbError::WouldBlock);
+        }
+
+        // Process actual datagram, finally.
+        let datagram = match ntb.get(datagram_index..datagram_index + datagram_len) {
+            Some(x) => x,
+            None => {
+                warn!("NDP has a datagram pointer out of range.");
+                self.read_ntb_size = 0;
+
+                return Err(UsbError::ParseError);
+            }
+        };
+        data[..datagram_len].copy_from_slice(datagram);
+
+        return Ok(datagram_len);
     }
 
     // /// Gets the address of the IN endpoint.
