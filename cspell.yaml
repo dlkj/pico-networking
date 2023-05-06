@@ -4,7 +4,9 @@ dictionaries:
 words:
   - addrs
   - DATAGRAM
+  - Deconfigured
   - defmt
+  - dhcpv
   - dpram
   - eabi
   - gpio
@@ -15,6 +17,7 @@ words:
   - plls
   - println
   - regs
+  - ROSC
   - rustc
   - rustup
   - smoltcp
