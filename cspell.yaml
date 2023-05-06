@@ -3,8 +3,9 @@ dictionaries:
   - softwareTerms
 words:
   - addrs
-  - DATAGRAM
-  - Deconfigured
+  - datagram
+  - datagrams
+  - deconfigured
   - defmt
   - dhcpv
   - dpram
@@ -12,12 +13,13 @@ words:
   - gpio
   - heapless
   - iface
-  - NOTIF
+  - notif
   - pico
   - plls
   - println
   - regs
-  - ROSC
+  - repr
+  - rosc
   - rustc
   - rustup
   - smoltcp

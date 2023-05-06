@@ -1,4 +1,4 @@
-use core::{cell::Cell, mem::size_of, ptr::copy_nonoverlapping};
+use core::cell::Cell;
 
 use defmt::{debug, error, warn, Format};
 use heapless::{String, Vec};
@@ -87,8 +87,6 @@ struct NcmOut<'a, B: UsbBus> {
 }
 
 /// Simple NTB header (NTH+NDP all in one) for sending packets
-#[repr(packed)]
-#[allow(unused)]
 struct NtbOutHeader {
     // NTH
     nth_sig: u32,
@@ -105,12 +103,6 @@ struct NtbOutHeader {
     ndp_datagram_len: u16,
     ndp_term1: u16,
     ndp_term2: u16,
-}
-
-fn byteify<T>(buf: &mut [u8], data: T) -> &[u8] {
-    let len = size_of::<T>();
-    unsafe { copy_nonoverlapping(&data as *const _ as *const u8, buf.as_mut_ptr(), len) }
-    &buf[..len]
 }
 
 impl<'a, B: UsbBus> CdcNcmClass<'a, B> {
@@ -188,17 +180,17 @@ impl<'a, B: UsbBus> CdcNcmClass<'a, B> {
 impl<'a, B: UsbBus> NcmIn<'a, B> {
     /// Writes a single packet into the IN endpoint.
     // pub fn write_packet(&mut self, data: &[u8]) -> Result<usize> {
-    pub fn write_datagram<F, R>(&mut self, len: usize, f: F) -> Result<R>
+    pub fn write_datagram<F, R>(&mut self, len: u16, f: F) -> Result<R>
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        const OUT_HEADER_LEN: usize = 28;
+        const OUT_HEADER_LEN: u16 = 28;
 
         if !self.can_write() {
             return Err(UsbError::WouldBlock);
         }
 
-        if len + OUT_HEADER_LEN > self.write_ntb_buffer.capacity() {
+        if usize::from(len + OUT_HEADER_LEN) > self.write_ntb_buffer.capacity() {
             return Err(UsbError::BufferOverflow);
         }
 
@@ -209,29 +201,49 @@ impl<'a, B: UsbBus> NcmIn<'a, B> {
             nth_sig: SIG_NTH,
             nth_len: 0x0c,
             nth_seq: seq,
-            nth_total_len: (len + OUT_HEADER_LEN) as u16,
+            nth_total_len: len + OUT_HEADER_LEN,
             nth_first_index: 0x0c,
 
             ndp_sig: SIG_NDP_NO_FCS,
             ndp_len: 0x10,
             ndp_next_index: 0x00,
-            ndp_datagram_index: OUT_HEADER_LEN as u16,
-            ndp_datagram_len: len as u16,
+            ndp_datagram_index: OUT_HEADER_LEN,
+            ndp_datagram_len: len,
             ndp_term1: 0x00,
             ndp_term2: 0x00,
         };
 
         self.write_ntb_sent = 0;
-        self.write_ntb_buffer
-            .resize_default(OUT_HEADER_LEN + len)
-            .map_err(|()| UsbError::BufferOverflow)?;
 
         // Write the header
-        let n = byteify(&mut self.write_ntb_buffer, header);
-        assert_eq!(n.len(), OUT_HEADER_LEN);
+        let header_fields: [&[u8]; 12] = [
+            &header.nth_sig.to_le_bytes(),
+            &header.nth_len.to_le_bytes(),
+            &header.nth_seq.to_le_bytes(),
+            &header.nth_total_len.to_le_bytes(),
+            &header.nth_first_index.to_le_bytes(),
+            &header.ndp_sig.to_le_bytes(),
+            &header.ndp_len.to_le_bytes(),
+            &header.ndp_next_index.to_le_bytes(),
+            &header.ndp_datagram_index.to_le_bytes(),
+            &header.ndp_datagram_len.to_le_bytes(),
+            &header.ndp_term1.to_le_bytes(),
+            &header.ndp_term2.to_le_bytes(),
+        ];
+
+        for s in header_fields {
+            self.write_ntb_buffer
+                .extend_from_slice(s)
+                .map_err(|()| UsbError::BufferOverflow)?;
+        }
+
+        assert_eq!(self.write_ntb_buffer.len(), OUT_HEADER_LEN.into());
+        self.write_ntb_buffer
+            .resize_default((OUT_HEADER_LEN + len).into())
+            .map_err(|()| UsbError::BufferOverflow)?;
 
         // Write the datagram
-        let result = f(&mut self.write_ntb_buffer[OUT_HEADER_LEN..]);
+        let result = f(&mut self.write_ntb_buffer[OUT_HEADER_LEN.into()..]);
 
         match self.write_packet() {
             Err(UsbError::WouldBlock) | Ok(_) => Ok(result),
@@ -319,40 +331,38 @@ impl<'a, B: UsbBus> NcmOut<'a, B> {
 
         let ntb = &self.read_ntb_buffer[..self.read_ntb_size];
 
-        // Process NTB header (NTH)
-        let nth = match ntb.get(..12) {
-            Some(x) => x,
-            None => {
-                warn!("Received too short NTB");
-                self.read_ntb_size = 0;
-                return Err(UsbError::ParseError);
-            }
+        // Process NTB header
+        let Some(ntb_header) = ntb.get(..12)
+        else {
+            warn!("Received too short NTB");
+            self.read_ntb_size = 0;
+            return Err(UsbError::ParseError);
         };
-        let sig = u32::from_le_bytes(nth[0..4].try_into().unwrap());
+        let sig = u32::from_le_bytes(ntb_header[0..4].try_into().unwrap());
         if sig != SIG_NTH {
             warn!("Received bad NTH sig.");
             self.read_ntb_size = 0;
             return Err(UsbError::ParseError);
         }
-        let ndp_idx = u16::from_le_bytes(nth[10..12].try_into().unwrap()) as usize;
+        let ndp_idx = u16::from_le_bytes(ntb_header[10..12].try_into().unwrap()) as usize;
 
-        // Process NTB Datagram Pointer (NDP)
-        let ndp = match ntb.get(ndp_idx..ndp_idx + 12) {
-            Some(x) => x,
-            None => {
+        // Process NTB Datagram Pointer
+        let Some(ntb_datagram_pointer) = ntb.get(ndp_idx..ndp_idx + 12)
+        else {
                 warn!("NTH has an NDP pointer out of range.");
                 self.read_ntb_size = 0;
                 return Err(UsbError::ParseError);
-            }
         };
-        let sig = u32::from_le_bytes(ndp[0..4].try_into().unwrap());
+        let sig = u32::from_le_bytes(ntb_datagram_pointer[0..4].try_into().unwrap());
         if sig != SIG_NDP_NO_FCS && sig != SIG_NDP_WITH_FCS {
             warn!("Received bad NDP sig.");
             self.read_ntb_size = 0;
             return Err(UsbError::ParseError);
         }
-        let datagram_index = u16::from_le_bytes(ndp[8..10].try_into().unwrap()) as usize;
-        let datagram_len = u16::from_le_bytes(ndp[10..12].try_into().unwrap()) as usize;
+        let datagram_index =
+            u16::from_le_bytes(ntb_datagram_pointer[8..10].try_into().unwrap()) as usize;
+        let datagram_len =
+            u16::from_le_bytes(ntb_datagram_pointer[10..12].try_into().unwrap()) as usize;
 
         if datagram_index == 0 || datagram_len == 0 {
             // empty, ignore. This is allowed by the spec, so don't warn.
@@ -361,7 +371,6 @@ impl<'a, B: UsbBus> NcmOut<'a, B> {
             return Err(UsbError::WouldBlock);
         }
 
-        // Process actual datagram, finally.
         if ntb
             .get(datagram_index..datagram_index + datagram_len)
             .is_none()
@@ -692,6 +701,6 @@ impl<'a, 'b, B: UsbBus> phy::TxToken for NcmTxToken<'a, 'b, B> {
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        self.ncm.write_datagram(len, f).unwrap()
+        self.ncm.write_datagram(len.try_into().unwrap(), f).unwrap()
     }
 }
