@@ -330,16 +330,14 @@ impl<'a, B: UsbBus> NcmOut<'a, B> {
 
 impl<B: UsbBus> UsbClass<B> for CdcNcmClass<'_, B> {
     fn get_configuration_descriptors(&self, writer: &mut DescriptorWriter) -> Result<()> {
-        const USB_CLASS_CDC_DATA: u8 = 0x0a;
-        const CDC_SUBCLASS_NCM: u8 = 0x0d;
-
         const CDC_PROTOCOL_NONE: u8 = 0x00;
         const CDC_PROTOCOL_NTB: u8 = 0x01;
-
-        const CS_INTERFACE: u8 = 0x24;
-        const CDC_TYPE_HEADER: u8 = 0x00;
+        const CDC_SUBCLASS_NCM: u8 = 0x0d;
         const CDC_TYPE_ETHERNET: u8 = 0x0F;
+        const CDC_TYPE_HEADER: u8 = 0x00;
         const CDC_TYPE_NCM: u8 = 0x1A;
+        const CS_INTERFACE: u8 = 0x24;
+        const USB_CLASS_CDC_DATA: u8 = 0x0a;
 
         // Interface Association Descriptor
 
@@ -453,62 +451,71 @@ impl<B: UsbBus> UsbClass<B> for CdcNcmClass<'_, B> {
 
         let req = transfer.request();
 
-        if (req.recipient, req.index)
-            == (
-                control::Recipient::Interface,
-                u16::from(u8::from(self.data_if)),
-            )
-        {
-            debug!(
+        if req.recipient != control::Recipient::Interface {
+            // Only handle interface requests
+            return;
+        }
+
+        if req.index == u16::from(u8::from(self.data_if)) {
+            warn!(
                 "ncm: unhandled DATA_INTERFACE control_in {} {}",
                 req.request_type, req.request
             );
-
             return;
         }
 
-        if (req.recipient, req.index)
-            != (
-                control::Recipient::Interface,
-                u16::from(u8::from(self.comm_if)),
-            )
-        {
-            return;
-        }
-
-        if req.request_type != RequestType::Class {
-            debug!(
-                "ncm: unhandled control_in {} {}",
-                req.request_type, req.request
+        if req.index != u16::from(u8::from(self.comm_if)) {
+            warn!(
+                "ncm: unexpected control_in interface {} - {} {}",
+                req.index, req.request_type, req.request
             );
             return;
         }
 
-        match req.request {
-            REQ_GET_NTB_PARAMETERS => {
-                transfer
-                    .accept(|data| {
-                        data[0..2].copy_from_slice(&28u16.to_le_bytes()); // length
-                        data[2..4].copy_from_slice(&1u16.to_le_bytes()); // bmNtbFormatsSupported - 16-bit
-                        data[4..8].copy_from_slice(&NTB_MAX_SIZE.to_le_bytes()); // dwNtbInMaxSize
-                        data[8..10].copy_from_slice(&4u16.to_le_bytes()); // wNdpInDivisor
-                        data[10..12].copy_from_slice(&0u16.to_le_bytes()); // wNdpInPayloadRemainder
-                        data[12..14].copy_from_slice(&4u16.to_le_bytes()); // wNdpInAlignment
-                        data[14..16].copy_from_slice(&0u16.to_le_bytes()); // reserved
-                        data[16..20].copy_from_slice(&NTB_MAX_SIZE.to_le_bytes()); // dwNtbOutMaxSize
-                        data[20..22].copy_from_slice(&4u16.to_le_bytes()); // wNdpOutDivisor
-                        data[22..24].copy_from_slice(&0u16.to_le_bytes()); // wNdpOutPayloadRemainder
-                        data[24..26].copy_from_slice(&4u16.to_le_bytes()); // wNdpOutAlignment
-                        data[26..28].copy_from_slice(&1u16.to_le_bytes()); // wNtbOutMaxDatagrams
-                        data[28] = 0xFF;
-                        Ok(28)
-                    })
-                    .ok();
-            }
-            e => {
-                debug!("ncm: control_in rejected {}", e);
-                transfer.reject().ok();
-            }
+        if (req.request_type, req.request) == (control::RequestType::Class, REQ_GET_NTB_PARAMETERS)
+        {
+            let _: Result<()> = transfer.accept(|data| {
+                const NTB_MAX_SIZE_BYTES: [u8; 4] = NTB_MAX_SIZE.to_le_bytes();
+                const LEN: u8 = 28;
+                if let Some(data) = data.get_mut(..LEN.into()) {
+                    data[0] = LEN; //wLength
+                    data[1] = 0x00;
+                    data[2] = 0x01; // bmNtbFormatsSupported - 16-bit NTB only
+                    data[3] = 0x00;
+                    data[4] = NTB_MAX_SIZE_BYTES[0]; // dwNtbInMaxSize
+                    data[5] = NTB_MAX_SIZE_BYTES[1];
+                    data[6] = NTB_MAX_SIZE_BYTES[2];
+                    data[7] = NTB_MAX_SIZE_BYTES[3];
+                    data[8] = 0x04; // wNdpInDivisor
+                    data[9] = 0x00;
+                    data[10] = 0x00; // wNdpInPayloadRemainder
+                    data[11] = 0x00;
+                    data[12] = 0x04; // wNdpInAlignment
+                    data[13] = 0x00;
+                    data[14] = 0x00; // wReserved
+                    data[15] = 0x00;
+                    data[16] = NTB_MAX_SIZE_BYTES[0]; // dwNtbOutMaxSize
+                    data[17] = NTB_MAX_SIZE_BYTES[1];
+                    data[18] = NTB_MAX_SIZE_BYTES[2];
+                    data[19] = NTB_MAX_SIZE_BYTES[3];
+                    data[20] = 0x04; // wNdpOutDivisor
+                    data[21] = 0x00;
+                    data[22] = 0x00; // wNdpOutPayloadRemainder
+                    data[23] = 0x00;
+                    data[24] = 0x04; // wNdpOutAlignment
+                    data[25] = 0x00;
+                    data[26] = 0x01; // wNtbOutMaxDatagrams
+                    data[27] = 0x00;
+                    Ok(LEN.into())
+                } else {
+                    Err(UsbError::BufferOverflow)
+                }
+            });
+        } else {
+            warn!(
+                "ncm: COMMUNICATION_INTERFACE control_in unhandled {} {}",
+                req.request_type, req.request
+            );
         }
     }
 
