@@ -24,34 +24,15 @@ const CDC_TYPE_NCM: u8 = 0x1A;
 
 const REQ_SET_INTERFACE: u8 = 11;
 
-const REQ_SEND_ENCAPSULATED_COMMAND: u8 = 0x00;
-//const REQ_GET_ENCAPSULATED_COMMAND: u8 = 0x01;
-//const REQ_SET_ETHERNET_MULTICAST_FILTERS: u8 = 0x40;
-//const REQ_SET_ETHERNET_POWER_MANAGEMENT_PATTERN_FILTER: u8 = 0x41;
-//const REQ_GET_ETHERNET_POWER_MANAGEMENT_PATTERN_FILTER: u8 = 0x42;
-//const REQ_SET_ETHERNET_PACKET_FILTER: u8 = 0x43;
-//const REQ_GET_ETHERNET_STATISTIC: u8 = 0x44;
 const REQ_GET_NTB_PARAMETERS: u8 = 0x80;
-//const REQ_GET_NET_ADDRESS: u8 = 0x81;
-//const REQ_SET_NET_ADDRESS: u8 = 0x82;
-//const REQ_GET_NTB_FORMAT: u8 = 0x83;
-//const REQ_SET_NTB_FORMAT: u8 = 0x84;
-//const REQ_GET_NTB_INPUT_SIZE: u8 = 0x85;
 const REQ_SET_NTB_INPUT_SIZE: u8 = 0x86;
-//const REQ_GET_MAX_DATAGRAM_SIZE: u8 = 0x87;
-//const REQ_SET_MAX_DATAGRAM_SIZE: u8 = 0x88;
-//const REQ_GET_CRC_MODE: u8 = 0x89;
-//const REQ_SET_CRC_MODE: u8 = 0x8A;
-
-//const NOTIF_MAX_PACKET_SIZE: u16 = 8;
-//const NOTIF_POLL_INTERVAL: u8 = 20;
 
 const NTB_MAX_SIZE: usize = 2048;
 const SIG_NTH: u32 = 0x484d_434e;
 const SIG_NDP_NO_FCS: u32 = 0x304d_434e;
 const SIG_NDP_WITH_FCS: u32 = 0x314d_434e;
 
-const MAX_PACKET_SIZE: usize = 64; // TODO unhardcode
+const MAX_PACKET_SIZE: usize = 64; // TODO more to type level generic
 
 #[derive(Default, Format, PartialEq, Eq, Clone, Copy)]
 pub enum State {
@@ -84,25 +65,6 @@ struct NcmOut<'a, B: UsbBus> {
     read_ntb_buffer: [u8; NTB_MAX_SIZE],
     read_ntb_size: usize,
     read_ntb_idx: Option<usize>,
-}
-
-/// Simple NTB header (NTH+NDP all in one) for sending packets
-struct NtbOutHeader {
-    // NTH
-    nth_sig: u32,
-    nth_len: u16,
-    nth_seq: u16,
-    nth_total_len: u16,
-    nth_first_index: u16,
-
-    // NDP
-    ndp_sig: u32,
-    ndp_len: u16,
-    ndp_next_index: u16,
-    ndp_datagram_index: u16,
-    ndp_datagram_len: u16,
-    ndp_term1: u16,
-    ndp_term2: u16,
 }
 
 impl<'a, B: UsbBus> CdcNcmClass<'a, B> {
@@ -143,13 +105,9 @@ impl<'a, B: UsbBus> CdcNcmClass<'a, B> {
         }
     }
 
-    // /// Gets the maximum packet size in bytes.
-    // pub fn max_packet_size(&self) -> u16 {
-    //     // The size is the same for both endpoints.
-    //     self.read_ep.max_packet_size()
-    // }
-
     pub fn connect(&mut self) -> Result<usize> {
+        // TODO implement ConnectionSpeedChange 7.1
+
         let result = self.comm_ep.write(&[
             0xA1, //bmRequestType
             0x00, //bNotificationType = NETWORK_CONNECTION
@@ -197,38 +155,24 @@ impl<'a, B: UsbBus> NcmIn<'a, B> {
         let seq = self.seq;
         self.seq = self.seq.wrapping_add(1);
 
-        let header = NtbOutHeader {
-            nth_sig: SIG_NTH,
-            nth_len: 0x0c,
-            nth_seq: seq,
-            nth_total_len: len + OUT_HEADER_LEN,
-            nth_first_index: 0x0c,
-
-            ndp_sig: SIG_NDP_NO_FCS,
-            ndp_len: 0x10,
-            ndp_next_index: 0x00,
-            ndp_datagram_index: OUT_HEADER_LEN,
-            ndp_datagram_len: len,
-            ndp_term1: 0x00,
-            ndp_term2: 0x00,
-        };
-
         self.write_ntb_sent = 0;
 
         // Write the header
         let header_fields: [&[u8]; 12] = [
-            &header.nth_sig.to_le_bytes(),
-            &header.nth_len.to_le_bytes(),
-            &header.nth_seq.to_le_bytes(),
-            &header.nth_total_len.to_le_bytes(),
-            &header.nth_first_index.to_le_bytes(),
-            &header.ndp_sig.to_le_bytes(),
-            &header.ndp_len.to_le_bytes(),
-            &header.ndp_next_index.to_le_bytes(),
-            &header.ndp_datagram_index.to_le_bytes(),
-            &header.ndp_datagram_len.to_le_bytes(),
-            &header.ndp_term1.to_le_bytes(),
-            &header.ndp_term2.to_le_bytes(),
+            // NTH
+            &SIG_NTH.to_le_bytes(),                // dwSignature
+            &0x000c_u16.to_le_bytes(),             // wHeaderLength
+            &seq.to_le_bytes(),                    // wSequence
+            &(len + OUT_HEADER_LEN).to_le_bytes(), // wBlockLength
+            &0x000c_u16.to_le_bytes(),             // wNdpIndex
+            // NDP
+            &SIG_NDP_NO_FCS.to_le_bytes(), // dwSignature
+            &0x0010_u16.to_le_bytes(),     // wLength
+            &0x0000u16.to_le_bytes(),      // wNextNdpIndex
+            &OUT_HEADER_LEN.to_le_bytes(), // wDatagramIndex
+            &len.to_le_bytes(),            // wDatagramLength
+            &0x0000u16.to_le_bytes(),      // wZeroIndex
+            &0x0000u16.to_le_bytes(),      // wZeroLength
         ];
 
         for s in header_fields {
@@ -567,6 +511,8 @@ impl<B: UsbBus> UsbClass<B> for CdcNcmClass<'_, B> {
                         debug!("data interface disabled");
                         self.data_if_enabled = false;
                         transfer.accept().ok();
+
+                        // TODO do a reset as per 7.2
                     } else if req.value == 1 {
                         debug!("data interface enabled");
                         self.data_if_enabled = true;
@@ -604,12 +550,6 @@ impl<B: UsbBus> UsbClass<B> for CdcNcmClass<'_, B> {
         }
 
         match req.request {
-            REQ_SEND_ENCAPSULATED_COMMAND => {
-                debug!("ncm: OUT REQ_SEND_ENCAPSULATED_COMMAND");
-                // We don't actually support encapsulated commands but pretend we do for standards
-                // compatibility.
-                transfer.accept().ok();
-            }
             REQ_SET_NTB_INPUT_SIZE => {
                 debug!("ncm: OUT REQ_SET_NTB_INPUT_SIZE");
                 // TODO
@@ -629,6 +569,10 @@ impl<B: UsbBus> UsbClass<B> for CdcNcmClass<'_, B> {
             warn!("unknown string index requested");
             None
         }
+    }
+
+    fn reset(&mut self) {
+        // TODO
     }
 }
 
