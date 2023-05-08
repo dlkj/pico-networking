@@ -32,6 +32,7 @@ const SIG_NDP_NO_FCS: u32 = 0x304d_434e;
 const SIG_NDP_WITH_FCS: u32 = 0x314d_434e;
 
 const MAX_PACKET_SIZE: usize = 64; // TODO more to type level generic
+const MAX_SEGMENT_SIZE: u16 = 1514;
 
 #[derive(Default, Format, PartialEq, Eq, Clone, Copy)]
 pub enum State {
@@ -358,41 +359,51 @@ impl<B: UsbBus> UsbClass<B> for CdcNcmClass<'_, B> {
             CDC_PROTOCOL_NONE,
         )?;
 
-        writer.write(
-            CS_INTERFACE,
-            &[
-                CDC_TYPE_HEADER, // bDescriptorSubtype
-                0x10,
-                0x01, // bcdCDC (1.10)
-            ],
-        )?;
+        writer.write_with(CS_INTERFACE, |buf| {
+            const LEN: usize = 3;
+            if let Some(buf) = buf.get_mut(..LEN) {
+                buf[0] = CDC_TYPE_HEADER; // bDescriptorSubtype
+                buf[1] = 0x20; // bcdCDC (1.20)
+                buf[2] = 0x01;
+                Ok(LEN)
+            } else {
+                Err(UsbError::BufferOverflow)
+            }
+        })?;
 
-        writer.write(
-            CS_INTERFACE,
-            &[
-                CDC_TYPE_ETHERNET,           // bDescriptorSubtype
-                self.mac_address_idx.into(), // iMACAddress
-                0,                           // bmEthernetStatistics
-                0,                           // |
-                0,                           // |
-                0,                           // |
-                0xea,                        // wMaxSegmentSize = 1514
-                0x05,                        // |
-                0,                           // wNumberMCFilters
-                0,                           // |
-                0,                           // bNumberPowerFilters
-            ],
-        )?;
+        writer.write_with(CS_INTERFACE, |buf| {
+            const LEN: usize = 11;
+            const MAX_SEGMENT_SIZE_BYTES: [u8; 2] = MAX_SEGMENT_SIZE.to_le_bytes();
+            if let Some(buf) = buf.get_mut(..LEN) {
+                buf[0] = CDC_TYPE_ETHERNET; // bDescriptorSubtype
+                buf[1] = self.mac_address_idx.into(); // iMACAddress
+                buf[2] = 0x00; // bmEthernetStatistics
+                buf[3] = 0x00;
+                buf[4] = 0x00;
+                buf[5] = 0x00;
+                buf[6] = MAX_SEGMENT_SIZE_BYTES[0]; // wMaxSegmentSize
+                buf[7] = MAX_SEGMENT_SIZE_BYTES[1];
+                buf[8] = 0x00; // wNumberMCFilters
+                buf[9] = 0x00;
+                buf[10] = 0x00; // bNumberPowerFilters
+                Ok(LEN)
+            } else {
+                Err(UsbError::BufferOverflow)
+            }
+        })?;
 
-        writer.write(
-            CS_INTERFACE,
-            &[
-                CDC_TYPE_NCM, // bDescriptorSubtype
-                0x00,         // bcdNCMVersion
-                0x01,         // |
-                0x00,         // bmCapabilities
-            ],
-        )?;
+        writer.write_with(CS_INTERFACE, |buf| {
+            const LEN: usize = 4;
+            if let Some(buf) = buf.get_mut(..LEN) {
+                buf[0] = CDC_TYPE_NCM; // bDescriptorSubtype
+                buf[1] = 0x00; // bcdCDC (1.00)
+                buf[2] = 0x01;
+                buf[3] = 0x00; // bmCapabilities - none
+                Ok(LEN)
+            } else {
+                Err(UsbError::BufferOverflow)
+            }
+        })?;
 
         // Endpoint descriptors for the Communication Class Interface
 
