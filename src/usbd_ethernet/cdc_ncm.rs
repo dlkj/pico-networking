@@ -18,7 +18,6 @@ const CDC_PROTOCOL_NTB: u8 = 0x01;
 
 const CS_INTERFACE: u8 = 0x24;
 const CDC_TYPE_HEADER: u8 = 0x00;
-const CDC_TYPE_UNION: u8 = 0x06;
 const CDC_TYPE_ETHERNET: u8 = 0x0F;
 const CDC_TYPE_NCM: u8 = 0x1A;
 
@@ -339,6 +338,8 @@ impl<'a, B: UsbBus> NcmOut<'a, B> {
 
 impl<B: UsbBus> UsbClass<B> for CdcNcmClass<'_, B> {
     fn get_configuration_descriptors(&self, writer: &mut DescriptorWriter) -> Result<()> {
+        // Interface Association Descriptor
+
         writer.iad(
             self.comm_if,
             2,
@@ -347,7 +348,8 @@ impl<B: UsbBus> UsbClass<B> for CdcNcmClass<'_, B> {
             CDC_PROTOCOL_NONE,
         )?;
 
-        // Control interface
+        // Communication Class Interface (interface n)
+        // Functional descriptors for the Communication Class Interface
 
         writer.interface(
             self.comm_if,
@@ -362,15 +364,6 @@ impl<B: UsbBus> UsbClass<B> for CdcNcmClass<'_, B> {
                 CDC_TYPE_HEADER, // bDescriptorSubtype
                 0x10,
                 0x01, // bcdCDC (1.10)
-            ],
-        )?;
-
-        writer.write(
-            CS_INTERFACE,
-            &[
-                CDC_TYPE_UNION,      // bDescriptorSubtype
-                self.comm_if.into(), // bControlInterface
-                self.data_if.into(), // bSubordinateInterface
             ],
         )?;
 
@@ -401,9 +394,12 @@ impl<B: UsbBus> UsbClass<B> for CdcNcmClass<'_, B> {
             ],
         )?;
 
+        // Endpoint descriptors for the Communication Class Interface
+
         writer.endpoint(&self.comm_ep)?;
 
-        // Data interface
+        // Data Class Interface (interface n+1, alternate setting 0)
+        // Functional descriptors for Data Class Interface (interface n+1, alternate setting 0)
 
         writer.interface_alt(
             self.data_if,
@@ -414,6 +410,9 @@ impl<B: UsbBus> UsbClass<B> for CdcNcmClass<'_, B> {
             None,
         )?;
 
+        // Data Class Interface (interface n+1, alternate setting 1)
+        // Functional descriptors for Data Class Interface (interface n+1, alternate setting 1)
+
         writer.interface_alt(
             self.data_if,
             1,
@@ -422,6 +421,8 @@ impl<B: UsbBus> UsbClass<B> for CdcNcmClass<'_, B> {
             CDC_PROTOCOL_NTB,
             None,
         )?;
+
+        // Endpoint descriptors for Data Class Interface (interface n+1, alternate setting 1)
 
         writer.endpoint(&self.ncm_in.write_ep)?;
         writer.endpoint(&self.ncm_out.read_ep)?;
