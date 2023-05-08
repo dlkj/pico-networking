@@ -127,7 +127,6 @@ fn generate_random_seed(ring_oscillator: &RingOscillator<hal::rosc::Enabled>) ->
     for i in 0..64 {
         seed += u64::from(ring_oscillator.get_random_bit()) << i;
     }
-    debug!("seed: {}", seed);
     seed
 }
 

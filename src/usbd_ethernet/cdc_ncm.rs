@@ -446,6 +446,7 @@ impl<B: UsbBus> UsbClass<B> for CdcNcmClass<'_, B> {
 
     fn control_in(&mut self, transfer: ControlIn<B>) {
         const REQ_GET_NTB_PARAMETERS: u8 = 0x80;
+        const REQ_GET_NTB_INPUT_SIZE: u8 = 0x85;
 
         let req = transfer.request();
 
@@ -510,7 +511,23 @@ impl<B: UsbBus> UsbClass<B> for CdcNcmClass<'_, B> {
                     }
                 });
             }
-            // TODO REQ_GET_NTB_INPUT_SIZE
+            (control::RequestType::Class, REQ_GET_NTB_INPUT_SIZE) => {
+                let _: Result<()> = transfer.accept(|data| {
+                    const NTB_MAX_SIZE_BYTES: [u8; 4] = NTB_MAX_SIZE.to_le_bytes();
+                    const LEN: u8 = 4;
+
+                    // We only support the minimum NTB maximum size so this can be a constant
+                    if let Some(data) = data.get_mut(..LEN.into()) {
+                        data[0] = NTB_MAX_SIZE_BYTES[0]; // dwNtbInMaxSize
+                        data[1] = NTB_MAX_SIZE_BYTES[1];
+                        data[2] = NTB_MAX_SIZE_BYTES[2];
+                        data[3] = NTB_MAX_SIZE_BYTES[3];
+                        Ok(LEN.into())
+                    } else {
+                        Err(UsbError::BufferOverflow)
+                    }
+                });
+            }
             _ => {
                 warn!(
                     "ncm: unhandled COMMUNICATION interface control_in {} {}",
@@ -522,6 +539,7 @@ impl<B: UsbBus> UsbClass<B> for CdcNcmClass<'_, B> {
 
     fn control_out(&mut self, transfer: ControlOut<B>) {
         const REQ_SET_INTERFACE: u8 = 0x0B;
+        const REQ_SET_NTB_INPUT_SIZE: u8 = 0x86;
 
         let req = transfer.request();
 
@@ -531,48 +549,60 @@ impl<B: UsbBus> UsbClass<B> for CdcNcmClass<'_, B> {
         }
 
         if req.index == u16::from(u8::from(self.comm_if)) {
-            // TODO REQ_SET_NTB_INPUT_SIZE
-
-            warn!(
-                "ncm: unhandled COMMUNICATION interface control_out {} {}",
-                req.request_type, req.request
-            );
-            return;
-        }
-
-        if req.index != u16::from(u8::from(self.data_if)) {
-            warn!(
-                "ncm: control_out unexpected interface {} - {} {}",
-                req.index, req.request_type, req.request
-            );
-            return;
-        }
-
-        match (req.request_type, req.request) {
-            (control::RequestType::Standard, REQ_SET_INTERFACE) => {
-                if req.value == 0 {
-                    debug!("data interface disabled");
-                    self.data_if_enabled = false;
-                    transfer.accept().ok();
-
-                    // TODO reset device as per 7.2
-                    self.reset();
-                } else if req.value == 1 {
-                    debug!("data interface enabled");
-                    self.data_if_enabled = true;
-                    transfer.accept().ok();
-                } else {
-                    error!("SET_INTERFACE out of range {}", req.request);
-                    transfer.reject().ok();
+            match (req.request_type, req.request) {
+                (control::RequestType::Class, REQ_SET_NTB_INPUT_SIZE) => {
+                    // We only support the minimum NTB maximum size the value
+                    // will always be NTB_MAX_SIZE
+                    if transfer.data() != NTB_MAX_SIZE.to_le_bytes() {
+                        warn!(
+                            "ncp: unexpected REQ_SET_NTB_INPUT_SIZE data {}",
+                            transfer.data()
+                        );
+                    }
+                    let _: Result<()> = transfer.accept();
+                }
+                _ => {
+                    warn!(
+                        "ncm: unhandled COMMUNICATION interface control_out {} {}",
+                        req.request_type, req.request
+                    );
                 }
             }
-            _ => {
-                debug!(
-                    "ncm: unhandled DATA_INTERFACE control_out {} {}",
-                    req.request_type, req.request
-                );
-            }
+            return;
         }
+
+        if req.index == u16::from(u8::from(self.data_if)) {
+            match (req.request_type, req.request) {
+                (control::RequestType::Standard, REQ_SET_INTERFACE) => {
+                    if req.value == 0 {
+                        debug!("data interface disabled");
+                        self.data_if_enabled = false;
+                        transfer.accept().ok();
+                        self.reset();
+                        // TODO reset device as per 7.2
+                    } else if req.value == 1 {
+                        debug!("data interface enabled");
+                        self.data_if_enabled = true;
+                        transfer.accept().ok();
+                    } else {
+                        error!("SET_INTERFACE out of range {}", req.request);
+                        transfer.reject().ok();
+                    }
+                }
+                _ => {
+                    warn!(
+                        "ncm: unhandled DATA_INTERFACE control_out {} {}",
+                        req.request_type, req.request
+                    );
+                }
+            }
+            return;
+        }
+
+        warn!(
+            "ncm: control_out unexpected interface {} - {} {}",
+            req.index, req.request_type, req.request
+        );
     }
 
     fn get_string(&self, index: StringIndex, _lang_id: u16) -> Option<&str> {
