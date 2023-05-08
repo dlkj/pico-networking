@@ -5,12 +5,10 @@ use heapless::{String, Vec};
 use smoltcp::phy::{self, Device, DeviceCapabilities, Medium};
 #[allow(clippy::wildcard_imports)]
 use usb_device::class_prelude::*;
-use usb_device::{control::RequestType, Result};
+use usb_device::Result;
 
 /// This should be used as `device_class` when building the `UsbDevice`.
 pub const USB_CLASS_CDC: u8 = 0x02;
-
-const REQ_SET_NTB_INPUT_SIZE: u8 = 0x86;
 
 const NTB_MAX_SIZE: usize = 2048;
 const SIG_NTH: u32 = 0x484d_434e;
@@ -466,56 +464,59 @@ impl<B: UsbBus> UsbClass<B> for CdcNcmClass<'_, B> {
 
         if req.index != u16::from(u8::from(self.comm_if)) {
             warn!(
-                "ncm: unexpected control_in interface {} - {} {}",
+                "ncm: control_in unexpected interface {} - {} {}",
                 req.index, req.request_type, req.request
             );
             return;
         }
 
-        if (req.request_type, req.request) == (control::RequestType::Class, REQ_GET_NTB_PARAMETERS)
-        {
-            let _: Result<()> = transfer.accept(|data| {
-                const NTB_MAX_SIZE_BYTES: [u8; 4] = NTB_MAX_SIZE.to_le_bytes();
-                const LEN: u8 = 28;
-                if let Some(data) = data.get_mut(..LEN.into()) {
-                    data[0] = LEN; //wLength
-                    data[1] = 0x00;
-                    data[2] = 0x01; // bmNtbFormatsSupported - 16-bit NTB only
-                    data[3] = 0x00;
-                    data[4] = NTB_MAX_SIZE_BYTES[0]; // dwNtbInMaxSize
-                    data[5] = NTB_MAX_SIZE_BYTES[1];
-                    data[6] = NTB_MAX_SIZE_BYTES[2];
-                    data[7] = NTB_MAX_SIZE_BYTES[3];
-                    data[8] = 0x04; // wNdpInDivisor
-                    data[9] = 0x00;
-                    data[10] = 0x00; // wNdpInPayloadRemainder
-                    data[11] = 0x00;
-                    data[12] = 0x04; // wNdpInAlignment
-                    data[13] = 0x00;
-                    data[14] = 0x00; // wReserved
-                    data[15] = 0x00;
-                    data[16] = NTB_MAX_SIZE_BYTES[0]; // dwNtbOutMaxSize
-                    data[17] = NTB_MAX_SIZE_BYTES[1];
-                    data[18] = NTB_MAX_SIZE_BYTES[2];
-                    data[19] = NTB_MAX_SIZE_BYTES[3];
-                    data[20] = 0x04; // wNdpOutDivisor
-                    data[21] = 0x00;
-                    data[22] = 0x00; // wNdpOutPayloadRemainder
-                    data[23] = 0x00;
-                    data[24] = 0x04; // wNdpOutAlignment
-                    data[25] = 0x00;
-                    data[26] = 0x01; // wNtbOutMaxDatagrams
-                    data[27] = 0x00;
-                    Ok(LEN.into())
-                } else {
-                    Err(UsbError::BufferOverflow)
-                }
-            });
-        } else {
-            warn!(
-                "ncm: COMMUNICATION_INTERFACE control_in unhandled {} {}",
-                req.request_type, req.request
-            );
+        match (req.request_type, req.request) {
+            (control::RequestType::Class, REQ_GET_NTB_PARAMETERS) => {
+                let _: Result<()> = transfer.accept(|data| {
+                    const NTB_MAX_SIZE_BYTES: [u8; 4] = NTB_MAX_SIZE.to_le_bytes();
+                    const LEN: u8 = 28;
+                    if let Some(data) = data.get_mut(..LEN.into()) {
+                        data[0] = LEN; //wLength
+                        data[1] = 0x00;
+                        data[2] = 0x01; // bmNtbFormatsSupported - 16-bit NTB supported only
+                        data[3] = 0x00;
+                        data[4] = NTB_MAX_SIZE_BYTES[0]; // dwNtbInMaxSize
+                        data[5] = NTB_MAX_SIZE_BYTES[1];
+                        data[6] = NTB_MAX_SIZE_BYTES[2];
+                        data[7] = NTB_MAX_SIZE_BYTES[3];
+                        data[8] = 0x04; // wNdpInDivisor
+                        data[9] = 0x00;
+                        data[10] = 0x00; // wNdpInPayloadRemainder
+                        data[11] = 0x00;
+                        data[12] = 0x04; // wNdpInAlignment
+                        data[13] = 0x00;
+                        data[14] = 0x00; // wReserved
+                        data[15] = 0x00;
+                        data[16] = NTB_MAX_SIZE_BYTES[0]; // dwNtbOutMaxSize
+                        data[17] = NTB_MAX_SIZE_BYTES[1];
+                        data[18] = NTB_MAX_SIZE_BYTES[2];
+                        data[19] = NTB_MAX_SIZE_BYTES[3];
+                        data[20] = 0x04; // wNdpOutDivisor
+                        data[21] = 0x00;
+                        data[22] = 0x00; // wNdpOutPayloadRemainder
+                        data[23] = 0x00;
+                        data[24] = 0x04; // wNdpOutAlignment
+                        data[25] = 0x00;
+                        data[26] = 0x01; // wNtbOutMaxDatagrams
+                        data[27] = 0x00;
+                        Ok(LEN.into())
+                    } else {
+                        Err(UsbError::BufferOverflow)
+                    }
+                });
+            }
+            // TODO REQ_GET_NTB_INPUT_SIZE
+            _ => {
+                warn!(
+                    "ncm: unhandled COMMUNICATION interface control_in {} {}",
+                    req.request_type, req.request
+                );
+            }
         }
     }
 
@@ -524,74 +525,61 @@ impl<B: UsbBus> UsbClass<B> for CdcNcmClass<'_, B> {
 
         let req = transfer.request();
 
-        if (req.recipient, req.index)
-            == (
-                control::Recipient::Interface,
-                u16::from(u8::from(self.data_if)),
-            )
-        {
-            match req.request {
-                REQ_SET_INTERFACE => {
-                    if req.value == 0 {
-                        debug!("data interface disabled");
-                        self.data_if_enabled = false;
-                        transfer.accept().ok();
-
-                        // TODO do a reset as per 7.2
-                    } else if req.value == 1 {
-                        debug!("data interface enabled");
-                        self.data_if_enabled = true;
-                        transfer.accept().ok();
-                    } else {
-                        error!("SET_INTERFACE out of range {}", req.request);
-                        transfer.reject().ok();
-                    }
-                }
-                _ => {
-                    debug!(
-                        "ncm: unhandled DATA_INTERFACE control_out {} {}",
-                        req.request_type, req.request
-                    );
-                }
-            }
+        if req.recipient != control::Recipient::Interface {
+            // Only handle interface requests
             return;
         }
 
-        if (req.recipient, req.index)
-            != (
-                control::Recipient::Interface,
-                u16::from(u8::from(self.comm_if)),
-            )
-        {
-            return;
-        }
+        if req.index == u16::from(u8::from(self.comm_if)) {
+            // TODO REQ_SET_NTB_INPUT_SIZE
 
-        if req.request_type != RequestType::Class {
-            debug!(
-                "ncm: unhandled control_out {} {}",
+            warn!(
+                "ncm: unhandled COMMUNICATION interface control_out {} {}",
                 req.request_type, req.request
             );
             return;
         }
 
-        match req.request {
-            REQ_SET_NTB_INPUT_SIZE => {
-                debug!("ncm: OUT REQ_SET_NTB_INPUT_SIZE");
-                // TODO
-                transfer.accept().ok();
+        if req.index != u16::from(u8::from(self.data_if)) {
+            warn!(
+                "ncm: control_out unexpected interface {} - {} {}",
+                req.index, req.request_type, req.request
+            );
+            return;
+        }
+
+        match (req.request_type, req.request) {
+            (control::RequestType::Standard, REQ_SET_INTERFACE) => {
+                if req.value == 0 {
+                    debug!("data interface disabled");
+                    self.data_if_enabled = false;
+                    transfer.accept().ok();
+
+                    // TODO reset device as per 7.2
+                    self.reset();
+                } else if req.value == 1 {
+                    debug!("data interface enabled");
+                    self.data_if_enabled = true;
+                    transfer.accept().ok();
+                } else {
+                    error!("SET_INTERFACE out of range {}", req.request);
+                    transfer.reject().ok();
+                }
             }
-            e => {
-                debug!("ncm: control_out rejected {}", e);
-                transfer.reject().ok();
+            _ => {
+                debug!(
+                    "ncm: unhandled DATA_INTERFACE control_out {} {}",
+                    req.request_type, req.request
+                );
             }
-        };
+        }
     }
 
     fn get_string(&self, index: StringIndex, _lang_id: u16) -> Option<&str> {
         if index == self.mac_address_idx {
             Some(&self.mac_address)
         } else {
-            warn!("unknown string index requested");
+            warn!("ncm: unknown string index requested {}", index);
             None
         }
     }
