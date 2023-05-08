@@ -10,20 +10,6 @@ use usb_device::{control::RequestType, Result};
 /// This should be used as `device_class` when building the `UsbDevice`.
 pub const USB_CLASS_CDC: u8 = 0x02;
 
-const USB_CLASS_CDC_DATA: u8 = 0x0a;
-const CDC_SUBCLASS_NCM: u8 = 0x0d;
-
-const CDC_PROTOCOL_NONE: u8 = 0x00;
-const CDC_PROTOCOL_NTB: u8 = 0x01;
-
-const CS_INTERFACE: u8 = 0x24;
-const CDC_TYPE_HEADER: u8 = 0x00;
-const CDC_TYPE_ETHERNET: u8 = 0x0F;
-const CDC_TYPE_NCM: u8 = 0x1A;
-
-const REQ_SET_INTERFACE: u8 = 11;
-
-const REQ_GET_NTB_PARAMETERS: u8 = 0x80;
 const REQ_SET_NTB_INPUT_SIZE: u8 = 0x86;
 
 const NTB_MAX_SIZE: usize = 2048;
@@ -106,12 +92,17 @@ impl<'a, B: UsbBus> CdcNcmClass<'a, B> {
     }
 
     pub fn connect(&mut self) -> Result<usize> {
+        const REQ_TYPE_DEVICE_TO_HOST: u8 = 0xA1;
+        const NETWORK_CONNECTION_CONNECTED: u8 = 0x01;
+        const NOTE_TYPE_NETWORK_CONNECTION: u8 = 0x00;
+        // const NOTE_TYPE_CONNECTION_SPEED_CHANGE: u8 = 0x2A;
+
         // TODO implement ConnectionSpeedChange 7.1
 
         let result = self.comm_ep.write(&[
-            0xA1, //bmRequestType
-            0x00, //bNotificationType = NETWORK_CONNECTION
-            0x01, // wValue = connected
+            REQ_TYPE_DEVICE_TO_HOST,      // bmRequestType
+            NOTE_TYPE_NETWORK_CONNECTION, // bNotificationType
+            NETWORK_CONNECTION_CONNECTED, // wValue
             0x00,
             self.data_if.into(), // wIndex = interface
             0x00,
@@ -339,6 +330,17 @@ impl<'a, B: UsbBus> NcmOut<'a, B> {
 
 impl<B: UsbBus> UsbClass<B> for CdcNcmClass<'_, B> {
     fn get_configuration_descriptors(&self, writer: &mut DescriptorWriter) -> Result<()> {
+        const USB_CLASS_CDC_DATA: u8 = 0x0a;
+        const CDC_SUBCLASS_NCM: u8 = 0x0d;
+
+        const CDC_PROTOCOL_NONE: u8 = 0x00;
+        const CDC_PROTOCOL_NTB: u8 = 0x01;
+
+        const CS_INTERFACE: u8 = 0x24;
+        const CDC_TYPE_HEADER: u8 = 0x00;
+        const CDC_TYPE_ETHERNET: u8 = 0x0F;
+        const CDC_TYPE_NCM: u8 = 0x1A;
+
         // Interface Association Descriptor
 
         writer.iad(
@@ -447,6 +449,8 @@ impl<B: UsbBus> UsbClass<B> for CdcNcmClass<'_, B> {
     }
 
     fn control_in(&mut self, transfer: ControlIn<B>) {
+        const REQ_GET_NTB_PARAMETERS: u8 = 0x80;
+
         let req = transfer.request();
 
         if (req.recipient, req.index)
@@ -509,6 +513,8 @@ impl<B: UsbBus> UsbClass<B> for CdcNcmClass<'_, B> {
     }
 
     fn control_out(&mut self, transfer: ControlOut<B>) {
+        const REQ_SET_INTERFACE: u8 = 0x0B;
+
         let req = transfer.request();
 
         if (req.recipient, req.index)
