@@ -13,6 +13,7 @@ words:
   - gpio
   - heapless
   - iface
+  - NCMH
   - notif
   - pico
   - plls

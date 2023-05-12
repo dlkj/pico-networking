@@ -9,6 +9,8 @@
 #![allow(clippy::struct_excessive_bools)]
 #![warn(clippy::use_self)]
 
+use core::str::from_utf8;
+
 use bsp::entry;
 use bsp::hal::{self, rosc::RingOscillator, Timer};
 use defmt::{debug, warn};
@@ -133,8 +135,8 @@ fn generate_random_seed(ring_oscillator: &RingOscillator<hal::rosc::Enabled>) ->
 
 fn server_poll(socket: &mut tcp::Socket) {
     if !socket.is_open() {
-        debug!("listening on 1234");
         socket.listen(1234).unwrap();
+        debug!("listening on 1234");
     }
 
     if socket.may_recv() {
@@ -142,7 +144,11 @@ fn server_poll(socket: &mut tcp::Socket) {
         socket
             .recv(|buffer| {
                 if !buffer.is_empty() {
-                    debug!("recv data: {:?}", buffer);
+                    if let Ok(s) = from_utf8(buffer) {
+                        debug!("recv data: {:?}", s);
+                    } else {
+                        debug!("recv data: {:?}", buffer);
+                    }
                 }
                 // Echo the data back in upper case
                 data.extend(buffer.iter().copied().map(|c| c.to_ascii_uppercase()));

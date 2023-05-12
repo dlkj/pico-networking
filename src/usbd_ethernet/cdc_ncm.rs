@@ -1,3 +1,4 @@
+use crate::usbd_ethernet::bytes::{Buf, BufMut};
 use defmt::{debug, error, info, warn, Format};
 use heapless::{String, Vec};
 use smoltcp::phy::{self, Device, DeviceCapabilities, Medium};
@@ -12,10 +13,9 @@ const NTB_MAX_SIZE: u32 = 2048;
 const NTB_MAX_SIZE_USIZE: usize = NTB_MAX_SIZE as usize;
 const MAX_SEGMENT_SIZE: u16 = 1514;
 
-// TODO represent these as strings rather than endian dependant u32s
-const SIG_NTH: u32 = 0x484d_434e;
-const SIG_NDP_NO_FCS: u32 = 0x304d_434e;
-const SIG_NDP_WITH_FCS: u32 = 0x314d_434e;
+const SIG_NTH: &[u8; 4] = b"NCMH";
+const SIG_NDP_NO_FCS: &[u8; 4] = b"NCM0";
+const SIG_NDP_WITH_FCS: &[u8; 4] = b"NCM1";
 
 const MAX_PACKET_SIZE: usize = 64; // TODO change to type level generics
 
@@ -90,10 +90,6 @@ impl<'a, B: UsbBus> CdcNcmClass<'a, B> {
             return Err(UsbError::InvalidState);
         }
 
-        // const NOTE_TYPE_CONNECTION_SPEED_CHANGE: u8 = 0x2A;
-
-        // TODO implement ConnectionSpeedChange 7.1
-
         let result = self.comm_ep.write(&[
             REQ_TYPE_DEVICE_TO_HOST,      // bmRequestType
             NOTE_TYPE_NETWORK_CONNECTION, // bNotificationType
@@ -156,13 +152,13 @@ impl<'a, B: UsbBus> NcmIn<'a, B> {
         // Write the header
         let header_fields: [&[u8]; 12] = [
             // NTH
-            &SIG_NTH.to_le_bytes(),                // dwSignature
+            SIG_NTH,                               // dwSignature
             &0x000c_u16.to_le_bytes(),             // wHeaderLength
             &seq.to_le_bytes(),                    // wSequence
             &(len + OUT_HEADER_LEN).to_le_bytes(), // wBlockLength
             &0x000c_u16.to_le_bytes(),             // wNdpIndex
             // NDP
-            &SIG_NDP_NO_FCS.to_le_bytes(), // dwSignature
+            SIG_NDP_NO_FCS,                // dwSignature
             &0x0010_u16.to_le_bytes(),     // wLength
             &0x0000u16.to_le_bytes(),      // wNextNdpIndex
             &OUT_HEADER_LEN.to_le_bytes(), // wDatagramIndex
@@ -227,6 +223,12 @@ impl<'a, B: UsbBus> NcmIn<'a, B> {
             Ok(())
         }
     }
+
+    fn reset(&mut self) {
+        self.seq = 0;
+        self.write_ntb_sent = 0;
+        self.write_ntb_buffer.clear();
+    }
 }
 
 impl<'a, B: UsbBus> NcmOut<'a, B> {
@@ -256,6 +258,8 @@ impl<'a, B: UsbBus> NcmOut<'a, B> {
 
     /// Reads a single packet from the OUT endpoint.
     pub fn read_packet(&mut self) -> Result<()> {
+        const NTB_HEADER_LEN: usize = 12;
+
         if self.read_ntb_idx.is_some() {
             return Ok(());
         }
@@ -274,37 +278,42 @@ impl<'a, B: UsbBus> NcmOut<'a, B> {
         let ntb = &self.read_ntb_buffer[..self.read_ntb_size];
 
         // Process NTB header
-        let Some(ntb_header) = ntb.get(..12)
+        let Some(mut ntb_header) = ntb.get(..NTB_HEADER_LEN)
         else {
             warn!("Received too short NTB");
             self.read_ntb_size = 0;
             return Err(UsbError::ParseError);
         };
-        let sig = u32::from_le_bytes(ntb_header[0..4].try_into().unwrap());
+        let sig = ntb_header.get_slice(4);
         if sig != SIG_NTH {
             warn!("Received bad NTH sig.");
             self.read_ntb_size = 0;
             return Err(UsbError::ParseError);
         }
-        let ndp_idx = u16::from_le_bytes(ntb_header[10..12].try_into().unwrap()) as usize;
+        ntb_header.advance(6); // wHeaderLength, wSequence, wBlockLength
+        let ndp_idx = usize::from(ntb_header.get_u16_le());
+        assert!(!ntb_header.has_remaining());
 
         // Process NTB Datagram Pointer
-        let Some(ntb_datagram_pointer) = ntb.get(ndp_idx..ndp_idx + 12)
+        let Some(mut ntb_datagram_pointer) = ntb.get(ndp_idx..NTB_HEADER_LEN + ndp_idx)
         else {
                 warn!("NTH has an NDP pointer out of range.");
                 self.read_ntb_size = 0;
                 return Err(UsbError::ParseError);
         };
-        let sig = u32::from_le_bytes(ntb_datagram_pointer[0..4].try_into().unwrap());
+
+        // wdSignature
+        let sig = ntb_datagram_pointer.get_slice(4);
         if sig != SIG_NDP_NO_FCS && sig != SIG_NDP_WITH_FCS {
             warn!("Received bad NDP sig.");
             self.read_ntb_size = 0;
             return Err(UsbError::ParseError);
         }
-        let datagram_index =
-            u16::from_le_bytes(ntb_datagram_pointer[8..10].try_into().unwrap()) as usize;
-        let datagram_len =
-            u16::from_le_bytes(ntb_datagram_pointer[10..12].try_into().unwrap()) as usize;
+
+        ntb_datagram_pointer.advance(4); // wLength, reserved
+
+        let datagram_index = usize::from(ntb_datagram_pointer.get_u16_le());
+        let datagram_len = usize::from(ntb_datagram_pointer.get_u16_le());
 
         if datagram_index == 0 || datagram_len == 0 {
             // empty, ignore. This is allowed by the spec, so don't warn.
@@ -332,6 +341,11 @@ impl<'a, B: UsbBus> NcmOut<'a, B> {
             Ok(_) => self.read_ntb_idx.is_some(),
             Err(_) => false,
         }
+    }
+
+    fn reset(&mut self) {
+        self.read_ntb_size = 0;
+        self.read_ntb_idx = None;
     }
 }
 
@@ -538,7 +552,8 @@ impl<B: UsbBus> UsbClass<B> for CdcNcmClass<'_, B> {
                     debug!("ncm: REQ_SET_NTB_INPUT_SIZE");
                     // We only support the minimum NTB maximum size the value
                     // will always be NTB_MAX_SIZE
-                    if transfer.data() != NTB_MAX_SIZE.to_le_bytes() {
+                    let ntb_input_size = transfer.data().get_u32_le();
+                    if ntb_input_size != NTB_MAX_SIZE {
                         warn!(
                             "ncp: unexpected REQ_SET_NTB_INPUT_SIZE data {}",
                             transfer.data()
@@ -608,7 +623,10 @@ impl<B: UsbBus> UsbClass<B> for CdcNcmClass<'_, B> {
     }
 
     fn reset(&mut self) {
-        // TODO
+        info!("ncm: reset");
+        self.ncm_in.reset();
+        self.ncm_out.reset();
+        self.state = State::Disabled;
     }
 }
 
@@ -682,48 +700,5 @@ impl<'a, 'b, B: UsbBus> phy::TxToken for NcmTxToken<'a, 'b, B> {
         F: FnOnce(&mut [u8]) -> R,
     {
         self.ncm.write_datagram(len.try_into().unwrap(), f).unwrap()
-    }
-}
-
-// hat tip to tokio-rs/bytes
-trait BufMut {
-    fn remaining_mut(&self) -> usize;
-    fn has_remaining_mut(&self) -> bool {
-        self.remaining_mut() > 0
-    }
-
-    fn put_slice(&mut self, src: &[u8]);
-
-    fn put_u8(&mut self, n: u8) {
-        let src = [n];
-        self.put_slice(&src);
-    }
-
-    fn put_u16_le(&mut self, n: u16) {
-        self.put_slice(&n.to_le_bytes());
-    }
-
-    fn put_u32_le(&mut self, n: u32) {
-        self.put_slice(&n.to_le_bytes());
-    }
-
-    fn put_u64_le(&mut self, n: u64) {
-        self.put_slice(&n.to_le_bytes());
-    }
-
-    fn put_u128_le(&mut self, n: u128) {
-        self.put_slice(&n.to_le_bytes());
-    }
-}
-
-impl BufMut for &mut [u8] {
-    fn remaining_mut(&self) -> usize {
-        self.len()
-    }
-
-    fn put_slice(&mut self, src: &[u8]) {
-        self[..src.len()].copy_from_slice(src);
-        let (_, b) = core::mem::take(self).split_at_mut(src.len());
-        *self = b;
     }
 }
