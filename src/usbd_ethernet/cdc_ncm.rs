@@ -1,6 +1,6 @@
 use crate::usbd_ethernet::bytes::{Buf, BufMut};
 use defmt::{debug, error, info, warn, Format};
-use heapless::{String, Vec};
+use heapless::String;
 use smoltcp::phy::{self, Device, DeviceCapabilities, Medium};
 #[allow(clippy::wildcard_imports)]
 use usb_device::class_prelude::*;
@@ -40,10 +40,72 @@ pub struct CdcNcmClass<'a, B: UsbBus> {
 
 struct NcmIn<'a, B: UsbBus> {
     write_ep: EndpointIn<'a, B>,
-    write_ntb_buffer: Vec<u8, NTB_MAX_SIZE_USIZE>,
-    write_ntb_sent: usize,
-    seq: u16,
+    buffer: RWBuffer,
+    next_seq: u16,
 }
+
+struct RWBuffer {
+    store: [u8; NTB_MAX_SIZE_USIZE],
+    read_ptr: usize,
+    write_ptr: usize,
+}
+impl RWBuffer {
+    const fn capacity(&self) -> usize {
+        self.store.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.write_ptr == 0
+    }
+
+    fn has_unread(&self) -> bool {
+        self.unread() > 0
+    }
+
+    fn unread(&self) -> usize {
+        assert!(self.read_ptr <= self.write_ptr);
+        self.write_ptr - self.read_ptr
+    }
+
+    fn write<R>(&mut self, len: usize, f: impl FnOnce(&mut [u8]) -> Result<R>) -> Result<R> {
+        let Some(buf) = self.store.get_mut(self.write_ptr .. self.write_ptr + len)
+        else{
+            error!("buffer: tried to write more data than capacity");
+            return Err(UsbError::BufferOverflow);
+        };
+        let r = f(buf)?;
+        self.write_ptr += len;
+        Ok(r)
+    }
+
+    fn clear(&mut self) {
+        self.read_ptr = 0;
+        self.write_ptr = 0;
+    }
+
+    fn read<R>(&mut self, len: usize, f: impl FnOnce(&[u8]) -> Result<R>) -> Result<R> {
+        if len > self.unread() {
+            error!("buffer: tried to read more data than available");
+            return Err(UsbError::InvalidState);
+        }
+
+        let buf = self.store.get(self.read_ptr..self.read_ptr + len).unwrap();
+
+        let r = f(buf)?;
+        self.read_ptr += len;
+        Ok(r)
+    }
+}
+impl Default for RWBuffer {
+    fn default() -> Self {
+        Self {
+            store: [0; NTB_MAX_SIZE_USIZE],
+            read_ptr: Default::default(),
+            write_ptr: Default::default(),
+        }
+    }
+}
+
 struct NcmOut<'a, B: UsbBus> {
     read_ep: EndpointOut<'a, B>,
     read_ntb_buffer: [u8; NTB_MAX_SIZE_USIZE],
@@ -64,9 +126,8 @@ impl<'a, B: UsbBus> CdcNcmClass<'a, B> {
             state: State::Disabled,
             ncm_in: NcmIn {
                 write_ep: alloc.bulk(max_packet_size),
-                write_ntb_buffer: Vec::default(),
-                write_ntb_sent: 0,
-                seq: 0,
+                buffer: RWBuffer::default(),
+                next_seq: 0,
             },
             ncm_out: NcmOut {
                 read_ep: alloc.bulk(max_packet_size),
@@ -129,7 +190,6 @@ fn mac_bytes_to_string(mac_address: [u8; 6]) -> String<12> {
 }
 impl<'a, B: UsbBus> NcmIn<'a, B> {
     /// Writes a single packet into the IN endpoint.
-    // pub fn write_packet(&mut self, data: &[u8]) -> Result<usize> {
     pub fn write_datagram<F, R>(&mut self, len: u16, f: F) -> Result<R>
     where
         F: FnOnce(&mut [u8]) -> R,
@@ -140,46 +200,35 @@ impl<'a, B: UsbBus> NcmIn<'a, B> {
             return Err(UsbError::WouldBlock);
         }
 
-        if usize::from(len + OUT_HEADER_LEN) > self.write_ntb_buffer.capacity() {
+        if usize::from(len + OUT_HEADER_LEN) > self.buffer.capacity() {
             return Err(UsbError::BufferOverflow);
         }
 
-        let seq = self.seq;
-        self.seq = self.seq.wrapping_add(1);
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.wrapping_add(1);
 
-        self.write_ntb_sent = 0;
+        self.buffer.write(usize::from(OUT_HEADER_LEN), |mut buf| {
+            buf.put_slice(SIG_NTH); // dwSignature
+            buf.put_u16_le(0x0c); // wHeaderLength
+            buf.put_u16_le(seq); // wSequence
+            buf.put_u16_le(len + OUT_HEADER_LEN); // wBlockLength
+            buf.put_u16_le(0x0c); // wNdpIndex
 
-        // Write the header
-        let header_fields: [&[u8]; 12] = [
-            // NTH
-            SIG_NTH,                               // dwSignature
-            &0x000c_u16.to_le_bytes(),             // wHeaderLength
-            &seq.to_le_bytes(),                    // wSequence
-            &(len + OUT_HEADER_LEN).to_le_bytes(), // wBlockLength
-            &0x000c_u16.to_le_bytes(),             // wNdpIndex
             // NDP
-            SIG_NDP_NO_FCS,                // dwSignature
-            &0x0010_u16.to_le_bytes(),     // wLength
-            &0x0000u16.to_le_bytes(),      // wNextNdpIndex
-            &OUT_HEADER_LEN.to_le_bytes(), // wDatagramIndex
-            &len.to_le_bytes(),            // wDatagramLength
-            &0x0000u16.to_le_bytes(),      // wZeroIndex
-            &0x0000u16.to_le_bytes(),      // wZeroLength
-        ];
+            buf.put_slice(SIG_NDP_NO_FCS); // dwSignature
+            buf.put_u16_le(0x0010); // wLength
+            buf.put_u16_le(0x0000); // wNextNdpIndex
+            buf.put_u16_le(OUT_HEADER_LEN); // wDatagramIndex
+            buf.put_u16_le(len); // wDatagramLength
+            buf.put_u16_le(0x0000); // wZeroIndex
+            buf.put_u16_le(0x0000); // wZeroLength
 
-        for s in header_fields {
-            self.write_ntb_buffer
-                .extend_from_slice(s)
-                .map_err(|()| UsbError::BufferOverflow)?;
-        }
-
-        assert_eq!(self.write_ntb_buffer.len(), OUT_HEADER_LEN.into());
-        self.write_ntb_buffer
-            .resize_default((OUT_HEADER_LEN + len).into())
-            .map_err(|()| UsbError::BufferOverflow)?;
+            assert!(!buf.has_remaining_mut());
+            Ok(())
+        })?;
 
         // Write the datagram
-        let result = f(&mut self.write_ntb_buffer[OUT_HEADER_LEN.into()..]);
+        let result = self.buffer.write(len.into(), |buf| Ok(f(buf)))?;
 
         match self.write_packet() {
             Err(UsbError::WouldBlock) | Ok(_) => Ok(result),
@@ -189,45 +238,45 @@ impl<'a, B: UsbBus> NcmIn<'a, B> {
 
     fn can_write(&mut self) -> bool {
         match self.write_packet() {
-            Ok(_) => self.write_ntb_buffer.is_empty(),
+            Ok(_) => self.buffer.is_empty(),
             Err(_) => false,
         }
     }
 
     fn write_packet(&mut self) -> Result<()> {
-        if self.write_ntb_buffer.is_empty() {
+        if self.buffer.is_empty() {
             Ok(())
         }
         // ZLP if % MAX_PACKET_SIZE
-        else if self.write_ntb_sent == self.write_ntb_buffer.len() {
+        else if !self.buffer.has_unread() {
             self.write_ep.write(&[])?;
             // TODO Handle errors
-            self.write_ntb_sent = 0;
-            self.write_ntb_buffer.clear();
+            self.buffer.clear();
+            debug!("sent ZLP");
             Ok(())
         }
         // Full packet
-        else if self.write_ntb_buffer.len() - self.write_ntb_sent >= MAX_PACKET_SIZE {
-            self.write_ep.write(
-                &self.write_ntb_buffer[self.write_ntb_sent..self.write_ntb_sent + MAX_PACKET_SIZE],
-            )?;
+        else if self.buffer.unread() >= MAX_PACKET_SIZE {
+            self.buffer
+                .read(MAX_PACKET_SIZE, |data| self.write_ep.write(data))?;
             // TODO Handle errors
-            self.write_ntb_sent += MAX_PACKET_SIZE;
+            debug!("sent FLP");
+
             Err(UsbError::WouldBlock)
         } else {
             // Short packet
-            self.write_ep
-                .write(&self.write_ntb_buffer[self.write_ntb_sent..])?;
-            self.write_ntb_sent = 0;
-            self.write_ntb_buffer.clear();
+            self.buffer
+                .read(self.buffer.unread(), |data| self.write_ep.write(data))?;
+            // TODO handle errors
+            self.buffer.clear();
+            debug!("sent SLP");
             Ok(())
         }
     }
 
     fn reset(&mut self) {
-        self.seq = 0;
-        self.write_ntb_sent = 0;
-        self.write_ntb_buffer.clear();
+        self.next_seq = 0;
+        self.buffer.clear();
     }
 }
 
