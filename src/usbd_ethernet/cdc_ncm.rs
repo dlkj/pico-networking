@@ -1,4 +1,4 @@
-use defmt::{debug, error, warn, Format};
+use defmt::{debug, error, info, warn, Format};
 use heapless::{String, Vec};
 use smoltcp::phy::{self, Device, DeviceCapabilities, Medium};
 #[allow(clippy::wildcard_imports)]
@@ -9,12 +9,14 @@ use usb_device::Result;
 pub const USB_CLASS_CDC: u8 = 0x02;
 
 const NTB_MAX_SIZE: usize = 2048;
+const MAX_SEGMENT_SIZE: u16 = 1514;
+
+// TODO represent these as strings rather than endian dependant u32s
 const SIG_NTH: u32 = 0x484d_434e;
 const SIG_NDP_NO_FCS: u32 = 0x304d_434e;
 const SIG_NDP_WITH_FCS: u32 = 0x314d_434e;
 
-const MAX_PACKET_SIZE: usize = 64; // TODO more to type level generic
-const MAX_SEGMENT_SIZE: u16 = 1514;
+const MAX_PACKET_SIZE: usize = 64; // TODO change to type level generics
 
 #[derive(Format, PartialEq, Eq, Clone, Copy)]
 pub enum State {
@@ -52,22 +54,11 @@ impl<'a, B: UsbBus> CdcNcmClass<'a, B> {
     pub fn new(alloc: &'a UsbBusAllocator<B>, mac_address: [u8; 6], max_packet_size: u16) -> Self {
         let mac_address_idx = alloc.string();
 
-        let mut s = String::new();
-        for i in 0..12 {
-            let n = (mac_address[i / 2] >> ((1 - i % 2) * 4)) & 0xF;
-            match n {
-                0x0..=0x9 => s.push(char::from(b'0' + n)),
-                0xA..=0xF => s.push(char::from(b'A' + n - 0xA)),
-                _ => unreachable!(),
-            }
-            .unwrap();
-        }
-
         Self {
             comm_if: alloc.interface(),
             comm_ep: alloc.interrupt(8, 255),
             data_if: alloc.interface(),
-            mac_address: s,
+            mac_address: mac_bytes_to_string(mac_address),
             mac_address_idx,
             state: State::Disabled,
             ncm_in: NcmIn {
@@ -89,6 +80,15 @@ impl<'a, B: UsbBus> CdcNcmClass<'a, B> {
         const REQ_TYPE_DEVICE_TO_HOST: u8 = 0xA1;
         const NETWORK_CONNECTION_CONNECTED: u8 = 0x01;
         const NOTE_TYPE_NETWORK_CONNECTION: u8 = 0x00;
+
+        if self.state != State::Enabled {
+            error!(
+                "ncm: state must be Enabled to connect. State: {}",
+                self.state
+            );
+            return Err(UsbError::InvalidState);
+        }
+
         // const NOTE_TYPE_CONNECTION_SPEED_CHANGE: u8 = 0x2A;
 
         // TODO implement ConnectionSpeedChange 7.1
@@ -104,7 +104,7 @@ impl<'a, B: UsbBus> CdcNcmClass<'a, B> {
             0x00,
         ]);
 
-        if result.is_ok() && self.state == State::Enabled {
+        if result.is_ok() {
             debug!("ncm: connecting");
             self.state = State::Connecting;
         }
@@ -115,6 +115,20 @@ impl<'a, B: UsbBus> CdcNcmClass<'a, B> {
     pub fn state(&self) -> State {
         self.state
     }
+}
+
+fn mac_bytes_to_string(mac_address: [u8; 6]) -> String<12> {
+    let mut s = String::new();
+    for i in 0..12 {
+        let n = (mac_address[i / 2] >> ((1 - i % 2) * 4)) & 0xF;
+        match n {
+            0x0..=0x9 => s.push(char::from(b'0' + n)),
+            0xA..=0xF => s.push(char::from(b'A' + n - 0xA)),
+            _ => unreachable!(),
+        }
+        .unwrap();
+    }
+    s
 }
 impl<'a, B: UsbBus> NcmIn<'a, B> {
     /// Writes a single packet into the IN endpoint.
@@ -428,6 +442,8 @@ impl<B: UsbBus> UsbClass<B> for CdcNcmClass<'_, B> {
         writer.endpoint(&self.ncm_in.write_ep)?;
         writer.endpoint(&self.ncm_out.read_ep)?;
 
+        debug!("ncm: configuration descriptors written");
+
         Ok(())
     }
 
@@ -460,6 +476,7 @@ impl<B: UsbBus> UsbClass<B> for CdcNcmClass<'_, B> {
 
         match (req.request_type, req.request) {
             (control::RequestType::Class, REQ_GET_NTB_PARAMETERS) => {
+                debug!("ncm: REQ_GET_NTB_PARAMETERS");
                 let _: Result<()> = transfer.accept(|data| {
                     const NTB_MAX_SIZE_BYTES: [u8; 4] = NTB_MAX_SIZE.to_le_bytes();
                     const LEN: u8 = 28;
@@ -499,6 +516,7 @@ impl<B: UsbBus> UsbClass<B> for CdcNcmClass<'_, B> {
                 });
             }
             (control::RequestType::Class, REQ_GET_NTB_INPUT_SIZE) => {
+                debug!("ncm: REQ_GET_NTB_INPUT_SIZE");
                 let _: Result<()> = transfer.accept(|data| {
                     const NTB_MAX_SIZE_BYTES: [u8; 4] = NTB_MAX_SIZE.to_le_bytes();
                     const LEN: u8 = 4;
@@ -538,6 +556,7 @@ impl<B: UsbBus> UsbClass<B> for CdcNcmClass<'_, B> {
         if req.index == u16::from(u8::from(self.comm_if)) {
             match (req.request_type, req.request) {
                 (control::RequestType::Class, REQ_SET_NTB_INPUT_SIZE) => {
+                    debug!("ncm: REQ_SET_NTB_INPUT_SIZE");
                     // We only support the minimum NTB maximum size the value
                     // will always be NTB_MAX_SIZE
                     if transfer.data() != NTB_MAX_SIZE.to_le_bytes() {
@@ -561,18 +580,19 @@ impl<B: UsbBus> UsbClass<B> for CdcNcmClass<'_, B> {
         if req.index == u16::from(u8::from(self.data_if)) {
             match (req.request_type, req.request) {
                 (control::RequestType::Standard, REQ_SET_INTERFACE) => {
+                    debug!("ncm: REQ_SET_INTERFACE");
                     if req.value == 0 {
                         transfer.accept().ok();
                         self.state = State::Disabled;
-                        debug!("data interface disabled");
+                        info!("ncm: data interface disabled");
                         self.reset();
                         // TODO reset device as per 7.2
                     } else if req.value == 1 {
-                        debug!("data interface enabled");
+                        info!("ncm: data interface enabled");
                         self.state = State::Enabled;
                         transfer.accept().ok();
                     } else {
-                        error!("SET_INTERFACE out of range {}", req.request);
+                        warn!("SET_INTERFACE out of range {}", req.request);
                         transfer.reject().ok();
                     }
                 }
@@ -594,7 +614,7 @@ impl<B: UsbBus> UsbClass<B> for CdcNcmClass<'_, B> {
 
     fn endpoint_in_complete(&mut self, addr: EndpointAddress) {
         if addr == self.comm_ep.address() && self.state == State::Connecting {
-            debug!("ncm: connected");
+            info!("ncm: connected");
             self.state = State::Connected;
         }
     }
@@ -623,7 +643,7 @@ impl<'a, B: UsbBus> Device for CdcNcmClass<'a, B> {
         &mut self,
         _timestamp: smoltcp::time::Instant,
     ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        if self.ncm_in.can_write() && self.ncm_out.can_read() {
+        if self.state == State::Connected && self.ncm_in.can_write() && self.ncm_out.can_read() {
             Some((
                 NcmRxToken::new(&mut self.ncm_out),
                 NcmTxToken::new(&mut self.ncm_in),
@@ -634,7 +654,7 @@ impl<'a, B: UsbBus> Device for CdcNcmClass<'a, B> {
     }
 
     fn transmit(&mut self, _timestamp: smoltcp::time::Instant) -> Option<Self::TxToken<'_>> {
-        if self.ncm_in.can_write() {
+        if self.state == State::Connected && self.ncm_in.can_write() {
             Some(NcmTxToken::new(&mut self.ncm_in))
         } else {
             None
@@ -643,7 +663,7 @@ impl<'a, B: UsbBus> Device for CdcNcmClass<'a, B> {
 
     fn capabilities(&self) -> smoltcp::phy::DeviceCapabilities {
         let mut caps = DeviceCapabilities::default();
-        caps.max_transmission_unit = 1536;
+        caps.max_transmission_unit = 1500; // TODO where should this number come from?
         caps.max_burst_size = Some(1);
         caps.medium = Medium::Ethernet;
         caps
