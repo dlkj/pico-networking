@@ -21,7 +21,7 @@ use smoltcp::{
     iface::{Config, Interface, SocketSet},
     socket::{dhcpv4, tcp},
     time::Instant,
-    wire::{EthernetAddress, IpAddress, IpCidr, Ipv4Address, Ipv4Cidr},
+    wire::{EthernetAddress, IpCidr, Ipv4Address, Ipv4Cidr},
 };
 #[allow(clippy::wildcard_imports)]
 use usb_device::class_prelude::*;
@@ -32,6 +32,9 @@ use crate::usbd_ethernet::cdc_ncm::State;
 use crate::usbd_ethernet::cdc_ncm::USB_CLASS_CDC;
 
 mod usbd_ethernet;
+
+const HOST_MAC_ADDR: [u8; 6] = [0x88, 0x88, 0x88, 0x88, 0x88, 0x88];
+const DEVICE_MAC_ADDR: [u8; 6] = [0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC];
 
 #[entry]
 fn main() -> ! {
@@ -60,9 +63,7 @@ fn main() -> ! {
         &mut pac.RESETS,
     ));
 
-    let host_mac_addr = [0x88, 0x88, 0x88, 0x88, 0x88, 0x88];
-
-    let mut cdc_ncm = CdcNcmClass::new(&usb_alloc, host_mac_addr, 64);
+    let mut cdc_ncm = CdcNcmClass::new(&usb_alloc, HOST_MAC_ADDR, 64);
 
     let mut usb_dev = UsbDeviceBuilder::new(&usb_alloc, UsbVidPid(0x1209, 0x0004))
         .manufacturer("pico-networking")
@@ -71,21 +72,11 @@ fn main() -> ! {
         .device_class(USB_CLASS_CDC)
         .build();
 
-    let our_mac_addr = [0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC];
     let mut config = Config::new();
-    config.hardware_addr = Some(EthernetAddress(our_mac_addr).into());
+    config.hardware_addr = Some(EthernetAddress(DEVICE_MAC_ADDR).into());
     config.random_seed = generate_random_seed(&ring_oscillator);
 
     let mut iface = Interface::new(config, &mut cdc_ncm);
-    iface.update_ip_addrs(|ip_addrs| {
-        ip_addrs
-            .push(IpCidr::new(IpAddress::v4(192, 168, 69, 1), 24))
-            .unwrap();
-    });
-    iface
-        .routes_mut()
-        .add_default_ipv4_route(Ipv4Address::new(192, 168, 69, 100))
-        .unwrap();
 
     // Create sockets
     let dhcp_socket = dhcpv4::Socket::new();
@@ -108,16 +99,17 @@ fn main() -> ! {
     let dhcp_handle = sockets.add(dhcp_socket);
 
     loop {
-        if usb_dev.poll(&mut [&mut cdc_ncm])
-            && cdc_ncm.state() == State::Configured
-            && cdc_ncm.data_if_enabled()
-        {
-            cdc_ncm.connect().ok();
+        if usb_dev.poll(&mut [&mut cdc_ncm]) && cdc_ncm.state() == State::Enabled {
+            let _: usb_device::Result<()> = cdc_ncm.connect();
         }
-        let timestamp = Instant::from_micros(i64::try_from(timer.get_counter().ticks()).unwrap());
-        if iface.poll(timestamp, &mut cdc_ncm, &mut sockets) {
-            server_poll(sockets.get_mut::<tcp::Socket>(server_handle));
-            dhcp_poll(&mut iface, sockets.get_mut::<dhcpv4::Socket>(dhcp_handle));
+
+        if cdc_ncm.state() == State::Connected {
+            let timestamp =
+                Instant::from_micros(i64::try_from(timer.get_counter().ticks()).unwrap());
+            if iface.poll(timestamp, &mut cdc_ncm, &mut sockets) {
+                server_poll(sockets.get_mut::<tcp::Socket>(server_handle));
+                dhcp_poll(&mut iface, sockets.get_mut::<dhcpv4::Socket>(dhcp_handle));
+            }
         }
     }
 }
@@ -189,7 +181,13 @@ fn dhcp_poll(iface: &mut Interface, socket: &mut dhcpv4::Socket) {
 
 fn set_ipv4_addr(iface: &mut Interface, cidr: Ipv4Cidr) {
     iface.update_ip_addrs(|addrs| {
-        let dest = addrs.iter_mut().next().unwrap();
-        *dest = IpCidr::Ipv4(cidr);
+        if let Some(a) = addrs
+            .iter_mut()
+            .find(|addr| matches!(addr, IpCidr::Ipv4(_)))
+        {
+            *a = IpCidr::Ipv4(cidr);
+        } else {
+            addrs.push(IpCidr::Ipv4(cidr)).unwrap();
+        }
     });
 }

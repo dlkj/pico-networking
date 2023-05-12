@@ -1,5 +1,3 @@
-use core::cell::Cell;
-
 use defmt::{debug, error, warn, Format};
 use heapless::{String, Vec};
 use smoltcp::phy::{self, Device, DeviceCapabilities, Medium};
@@ -18,11 +16,11 @@ const SIG_NDP_WITH_FCS: u32 = 0x314d_434e;
 const MAX_PACKET_SIZE: usize = 64; // TODO more to type level generic
 const MAX_SEGMENT_SIZE: u16 = 1514;
 
-#[derive(Default, Format, PartialEq, Eq, Clone, Copy)]
+#[derive(Format, PartialEq, Eq, Clone, Copy)]
 pub enum State {
-    #[default]
-    Init,
-    Configured,
+    Disabled,
+    Enabled,
+    Connecting,
     Connected,
 }
 
@@ -30,10 +28,9 @@ pub struct CdcNcmClass<'a, B: UsbBus> {
     comm_if: InterfaceNumber,
     comm_ep: EndpointIn<'a, B>,
     data_if: InterfaceNumber,
-    data_if_enabled: bool,
     mac_address: String<12>,
     mac_address_idx: StringIndex,
-    state: Cell<State>,
+    state: State,
     ncm_in: NcmIn<'a, B>,
     ncm_out: NcmOut<'a, B>,
 }
@@ -70,10 +67,9 @@ impl<'a, B: UsbBus> CdcNcmClass<'a, B> {
             comm_if: alloc.interface(),
             comm_ep: alloc.interrupt(8, 255),
             data_if: alloc.interface(),
-            data_if_enabled: false,
             mac_address: s,
             mac_address_idx,
-            state: Cell::default(),
+            state: State::Disabled,
             ncm_in: NcmIn {
                 write_ep: alloc.bulk(max_packet_size),
                 write_ntb_buffer: Vec::default(),
@@ -89,7 +85,7 @@ impl<'a, B: UsbBus> CdcNcmClass<'a, B> {
         }
     }
 
-    pub fn connect(&mut self) -> Result<usize> {
+    pub fn connect(&mut self) -> Result<()> {
         const REQ_TYPE_DEVICE_TO_HOST: u8 = 0xA1;
         const NETWORK_CONNECTION_CONNECTED: u8 = 0x01;
         const NOTE_TYPE_NETWORK_CONNECTION: u8 = 0x00;
@@ -108,20 +104,16 @@ impl<'a, B: UsbBus> CdcNcmClass<'a, B> {
             0x00,
         ]);
 
-        if result.is_ok() && self.state.get_mut() == &State::Configured {
-            debug!("Sent connect - enabled");
-            *self.state.get_mut() = State::Connected;
+        if result.is_ok() && self.state == State::Enabled {
+            debug!("ncm: connecting");
+            self.state = State::Connecting;
         }
 
-        result
+        result.map(drop)
     }
 
     pub fn state(&self) -> State {
-        self.state.get()
-    }
-
-    pub fn data_if_enabled(&self) -> bool {
-        self.data_if_enabled
+        self.state
     }
 }
 impl<'a, B: UsbBus> NcmIn<'a, B> {
@@ -436,11 +428,6 @@ impl<B: UsbBus> UsbClass<B> for CdcNcmClass<'_, B> {
         writer.endpoint(&self.ncm_in.write_ep)?;
         writer.endpoint(&self.ncm_out.read_ep)?;
 
-        debug!("get_configuration_descriptors sent");
-        if self.state.get() == State::Init {
-            self.state.set(State::Configured);
-        }
-
         Ok(())
     }
 
@@ -575,14 +562,14 @@ impl<B: UsbBus> UsbClass<B> for CdcNcmClass<'_, B> {
             match (req.request_type, req.request) {
                 (control::RequestType::Standard, REQ_SET_INTERFACE) => {
                     if req.value == 0 {
-                        debug!("data interface disabled");
-                        self.data_if_enabled = false;
                         transfer.accept().ok();
+                        self.state = State::Disabled;
+                        debug!("data interface disabled");
                         self.reset();
                         // TODO reset device as per 7.2
                     } else if req.value == 1 {
                         debug!("data interface enabled");
-                        self.data_if_enabled = true;
+                        self.state = State::Enabled;
                         transfer.accept().ok();
                     } else {
                         error!("SET_INTERFACE out of range {}", req.request);
@@ -603,6 +590,13 @@ impl<B: UsbBus> UsbClass<B> for CdcNcmClass<'_, B> {
             "ncm: control_out unexpected interface {} - {} {}",
             req.index, req.request_type, req.request
         );
+    }
+
+    fn endpoint_in_complete(&mut self, addr: EndpointAddress) {
+        if addr == self.comm_ep.address() && self.state == State::Connecting {
+            debug!("ncm: connected");
+            self.state = State::Connected;
+        }
     }
 
     fn get_string(&self, index: StringIndex, _lang_id: u16) -> Option<&str> {
