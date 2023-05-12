@@ -43,6 +43,15 @@ fn main() -> ! {
     let timer = Timer::new(pac.TIMER, &mut pac.RESETS);
     let ring_oscillator = RingOscillator::new(pac.ROSC).initialize();
 
+    // Prevent https://github.com/rp-rs/rp-hal/issues/606 occurring
+    let sio = hal::sio::Sio::new(pac.SIO);
+    let _pins = hal::gpio::Pins::new(
+        pac.IO_BANK0,
+        pac.PADS_BANK0,
+        sio.gpio_bank0,
+        &mut pac.RESETS,
+    );
+
     let clocks = init_clocks_and_plls(
         bsp::XOSC_CRYSTAL_FREQ,
         pac.XOSC,
