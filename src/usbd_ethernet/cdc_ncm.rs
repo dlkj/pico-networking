@@ -8,7 +8,8 @@ use usb_device::Result;
 /// This should be used as `device_class` when building the `UsbDevice`.
 pub const USB_CLASS_CDC: u8 = 0x02;
 
-const NTB_MAX_SIZE: usize = 2048;
+const NTB_MAX_SIZE: u32 = 2048;
+const NTB_MAX_SIZE_USIZE: usize = NTB_MAX_SIZE as usize;
 const MAX_SEGMENT_SIZE: u16 = 1514;
 
 // TODO represent these as strings rather than endian dependant u32s
@@ -39,13 +40,13 @@ pub struct CdcNcmClass<'a, B: UsbBus> {
 
 struct NcmIn<'a, B: UsbBus> {
     write_ep: EndpointIn<'a, B>,
-    write_ntb_buffer: Vec<u8, NTB_MAX_SIZE>,
+    write_ntb_buffer: Vec<u8, NTB_MAX_SIZE_USIZE>,
     write_ntb_sent: usize,
     seq: u16,
 }
 struct NcmOut<'a, B: UsbBus> {
     read_ep: EndpointOut<'a, B>,
-    read_ntb_buffer: [u8; NTB_MAX_SIZE],
+    read_ntb_buffer: [u8; NTB_MAX_SIZE_USIZE],
     read_ntb_size: usize,
     read_ntb_idx: Option<usize>,
 }
@@ -69,7 +70,7 @@ impl<'a, B: UsbBus> CdcNcmClass<'a, B> {
             },
             ncm_out: NcmOut {
                 read_ep: alloc.bulk(max_packet_size),
-                read_ntb_buffer: [0; NTB_MAX_SIZE],
+                read_ntb_buffer: [0; NTB_MAX_SIZE_USIZE],
                 read_ntb_size: 0,
                 read_ntb_idx: None,
             },
@@ -264,7 +265,9 @@ impl<'a, B: UsbBus> NcmOut<'a, B> {
             .read(&mut self.read_ntb_buffer[self.read_ntb_size..])?;
         self.read_ntb_size += n;
 
-        if n == usize::from(self.read_ep.max_packet_size()) && self.read_ntb_size <= NTB_MAX_SIZE {
+        if n == usize::from(self.read_ep.max_packet_size())
+            && self.read_ntb_size <= NTB_MAX_SIZE_USIZE
+        {
             return Err(UsbError::WouldBlock);
         }
 
@@ -365,10 +368,10 @@ impl<B: UsbBus> UsbClass<B> for CdcNcmClass<'_, B> {
 
         writer.write_with(CS_INTERFACE, |buf| {
             const LEN: usize = 3;
-            if let Some(buf) = buf.get_mut(..LEN) {
-                buf[0] = CDC_TYPE_HEADER; // bDescriptorSubtype
-                buf[1] = 0x20; // bcdCDC (1.20)
-                buf[2] = 0x01;
+            if let Some(mut buf) = buf.get_mut(..LEN) {
+                buf.put_u8(CDC_TYPE_HEADER); // bDescriptorSubtype
+                buf.put_u16_le(0x0120); // bcdCDC (1.20)
+                assert!(!buf.has_remaining_mut());
                 Ok(LEN)
             } else {
                 Err(UsbError::BufferOverflow)
@@ -377,19 +380,14 @@ impl<B: UsbBus> UsbClass<B> for CdcNcmClass<'_, B> {
 
         writer.write_with(CS_INTERFACE, |buf| {
             const LEN: usize = 11;
-            const MAX_SEGMENT_SIZE_BYTES: [u8; 2] = MAX_SEGMENT_SIZE.to_le_bytes();
-            if let Some(buf) = buf.get_mut(..LEN) {
-                buf[0] = CDC_TYPE_ETHERNET; // bDescriptorSubtype
-                buf[1] = self.mac_address_idx.into(); // iMACAddress
-                buf[2] = 0x00; // bmEthernetStatistics
-                buf[3] = 0x00;
-                buf[4] = 0x00;
-                buf[5] = 0x00;
-                buf[6] = MAX_SEGMENT_SIZE_BYTES[0]; // wMaxSegmentSize
-                buf[7] = MAX_SEGMENT_SIZE_BYTES[1];
-                buf[8] = 0x00; // wNumberMCFilters
-                buf[9] = 0x00;
-                buf[10] = 0x00; // bNumberPowerFilters
+            if let Some(mut buf) = buf.get_mut(..LEN) {
+                buf.put_u8(CDC_TYPE_ETHERNET); // bDescriptorSubtype
+                buf.put_u8(self.mac_address_idx.into()); // iMACAddress
+                buf.put_u32_le(0); // bmEthernetStatistics
+                buf.put_u16_le(MAX_SEGMENT_SIZE); // wMaxSegmentSize
+                buf.put_u16_le(0); // wNumberMCFilters
+                buf.put_u8(0); // bNumberPowerFilters
+                assert!(!buf.has_remaining_mut());
                 Ok(LEN)
             } else {
                 Err(UsbError::BufferOverflow)
@@ -398,11 +396,11 @@ impl<B: UsbBus> UsbClass<B> for CdcNcmClass<'_, B> {
 
         writer.write_with(CS_INTERFACE, |buf| {
             const LEN: usize = 4;
-            if let Some(buf) = buf.get_mut(..LEN) {
-                buf[0] = CDC_TYPE_NCM; // bDescriptorSubtype
-                buf[1] = 0x00; // bcdCDC (1.00)
-                buf[2] = 0x01;
-                buf[3] = 0x00; // bmCapabilities - none
+            if let Some(mut buf) = buf.get_mut(..LEN) {
+                buf.put_u8(CDC_TYPE_NCM); // bDescriptorSubtype
+                buf.put_u16_le(0x0100); // bcdCDC (1.00)
+                buf.put_u8(0x00); // bmCapabilities - none
+                assert!(!buf.has_remaining_mut());
                 Ok(LEN)
             } else {
                 Err(UsbError::BufferOverflow)
@@ -478,37 +476,21 @@ impl<B: UsbBus> UsbClass<B> for CdcNcmClass<'_, B> {
             (control::RequestType::Class, REQ_GET_NTB_PARAMETERS) => {
                 debug!("ncm: REQ_GET_NTB_PARAMETERS");
                 let _: Result<()> = transfer.accept(|data| {
-                    const NTB_MAX_SIZE_BYTES: [u8; 4] = NTB_MAX_SIZE.to_le_bytes();
-                    const LEN: u8 = 28;
-                    if let Some(data) = data.get_mut(..LEN.into()) {
-                        data[0] = LEN; //wLength
-                        data[1] = 0x00;
-                        data[2] = 0x01; // bmNtbFormatsSupported - 16-bit NTB supported only
-                        data[3] = 0x00;
-                        data[4] = NTB_MAX_SIZE_BYTES[0]; // dwNtbInMaxSize
-                        data[5] = NTB_MAX_SIZE_BYTES[1];
-                        data[6] = NTB_MAX_SIZE_BYTES[2];
-                        data[7] = NTB_MAX_SIZE_BYTES[3];
-                        data[8] = 0x04; // wNdpInDivisor
-                        data[9] = 0x00;
-                        data[10] = 0x00; // wNdpInPayloadRemainder
-                        data[11] = 0x00;
-                        data[12] = 0x04; // wNdpInAlignment
-                        data[13] = 0x00;
-                        data[14] = 0x00; // wReserved
-                        data[15] = 0x00;
-                        data[16] = NTB_MAX_SIZE_BYTES[0]; // dwNtbOutMaxSize
-                        data[17] = NTB_MAX_SIZE_BYTES[1];
-                        data[18] = NTB_MAX_SIZE_BYTES[2];
-                        data[19] = NTB_MAX_SIZE_BYTES[3];
-                        data[20] = 0x04; // wNdpOutDivisor
-                        data[21] = 0x00;
-                        data[22] = 0x00; // wNdpOutPayloadRemainder
-                        data[23] = 0x00;
-                        data[24] = 0x04; // wNdpOutAlignment
-                        data[25] = 0x00;
-                        data[26] = 0x01; // wNtbOutMaxDatagrams
-                        data[27] = 0x00;
+                    const LEN: u16 = 28;
+                    if let Some(mut data) = data.get_mut(..LEN.into()) {
+                        data.put_u16_le(LEN); //wLength
+                        data.put_u16_le(0x01); // bmNtbFormatsSupported - 16-bit NTB supported only
+                        data.put_u32_le(NTB_MAX_SIZE); // dwNtbInMaxSize
+                        data.put_u16_le(0x04); // wNdpInDivisor
+                        data.put_u16_le(0x00); // wNdpInPayloadRemainder
+                        data.put_u16_le(0x04); // wNdpInAlignment
+                        data.put_u16_le(0x00); // wReserved
+                        data.put_u32_le(NTB_MAX_SIZE); // dwNtbOutMaxSize
+                        data.put_u16_le(0x04); // wNdpOutDivisor
+                        data.put_u16_le(0x00); // wNdpOutPayloadRemainder
+                        data.put_u16_le(0x04); // wNdpOutAlignment
+                        data.put_u16_le(0x01); // wNtbOutMaxDatagrams
+                        assert!(!data.has_remaining_mut());
                         Ok(LEN.into())
                     } else {
                         Err(UsbError::BufferOverflow)
@@ -518,16 +500,13 @@ impl<B: UsbBus> UsbClass<B> for CdcNcmClass<'_, B> {
             (control::RequestType::Class, REQ_GET_NTB_INPUT_SIZE) => {
                 debug!("ncm: REQ_GET_NTB_INPUT_SIZE");
                 let _: Result<()> = transfer.accept(|data| {
-                    const NTB_MAX_SIZE_BYTES: [u8; 4] = NTB_MAX_SIZE.to_le_bytes();
-                    const LEN: u8 = 4;
+                    const LEN: usize = 4;
 
                     // We only support the minimum NTB maximum size so this can be a constant
-                    if let Some(data) = data.get_mut(..LEN.into()) {
-                        data[0] = NTB_MAX_SIZE_BYTES[0]; // dwNtbInMaxSize
-                        data[1] = NTB_MAX_SIZE_BYTES[1];
-                        data[2] = NTB_MAX_SIZE_BYTES[2];
-                        data[3] = NTB_MAX_SIZE_BYTES[3];
-                        Ok(LEN.into())
+                    if let Some(mut data) = data.get_mut(..LEN) {
+                        data.put_u32_le(NTB_MAX_SIZE);
+                        assert!(!data.has_remaining_mut()); // dwNtbInMaxSize
+                        Ok(LEN)
                     } else {
                         Err(UsbError::BufferOverflow)
                     }
@@ -703,5 +682,48 @@ impl<'a, 'b, B: UsbBus> phy::TxToken for NcmTxToken<'a, 'b, B> {
         F: FnOnce(&mut [u8]) -> R,
     {
         self.ncm.write_datagram(len.try_into().unwrap(), f).unwrap()
+    }
+}
+
+// hat tip to tokio-rs/bytes
+trait BufMut {
+    fn remaining_mut(&self) -> usize;
+    fn has_remaining_mut(&self) -> bool {
+        self.remaining_mut() > 0
+    }
+
+    fn put_slice(&mut self, src: &[u8]);
+
+    fn put_u8(&mut self, n: u8) {
+        let src = [n];
+        self.put_slice(&src);
+    }
+
+    fn put_u16_le(&mut self, n: u16) {
+        self.put_slice(&n.to_le_bytes());
+    }
+
+    fn put_u32_le(&mut self, n: u32) {
+        self.put_slice(&n.to_le_bytes());
+    }
+
+    fn put_u64_le(&mut self, n: u64) {
+        self.put_slice(&n.to_le_bytes());
+    }
+
+    fn put_u128_le(&mut self, n: u128) {
+        self.put_slice(&n.to_le_bytes());
+    }
+}
+
+impl BufMut for &mut [u8] {
+    fn remaining_mut(&self) -> usize {
+        self.len()
+    }
+
+    fn put_slice(&mut self, src: &[u8]) {
+        self[..src.len()].copy_from_slice(src);
+        let (_, b) = core::mem::take(self).split_at_mut(src.len());
+        *self = b;
     }
 }
