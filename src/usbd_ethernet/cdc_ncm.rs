@@ -1,4 +1,5 @@
-use crate::usbd_ethernet::bytes::{Buf, BufMut};
+use super::buffer::RWBuffer;
+use super::bytes::{Buf, BufMut};
 use defmt::{debug, error, info, warn, Format};
 use heapless::String;
 use smoltcp::phy::{self, Device, DeviceCapabilities, Medium};
@@ -40,77 +41,15 @@ pub struct CdcNcmClass<'a, B: UsbBus> {
 
 struct NcmIn<'a, B: UsbBus> {
     write_ep: EndpointIn<'a, B>,
-    buffer: RWBuffer,
+    buffer: RWBuffer<NTB_MAX_SIZE_USIZE>,
     next_seq: u16,
-}
-
-struct RWBuffer {
-    store: [u8; NTB_MAX_SIZE_USIZE],
-    read_ptr: usize,
-    write_ptr: usize,
-}
-impl RWBuffer {
-    const fn capacity(&self) -> usize {
-        self.store.len()
-    }
-
-    fn is_empty(&self) -> bool {
-        self.write_ptr == 0
-    }
-
-    fn has_unread(&self) -> bool {
-        self.unread() > 0
-    }
-
-    fn unread(&self) -> usize {
-        assert!(self.read_ptr <= self.write_ptr);
-        self.write_ptr - self.read_ptr
-    }
-
-    fn write<R>(&mut self, len: usize, f: impl FnOnce(&mut [u8]) -> Result<R>) -> Result<R> {
-        let Some(buf) = self.store.get_mut(self.write_ptr .. self.write_ptr + len)
-        else{
-            error!("buffer: tried to write more data than capacity");
-            return Err(UsbError::BufferOverflow);
-        };
-        let r = f(buf)?;
-        self.write_ptr += len;
-        Ok(r)
-    }
-
-    fn clear(&mut self) {
-        self.read_ptr = 0;
-        self.write_ptr = 0;
-    }
-
-    fn read<R>(&mut self, len: usize, f: impl FnOnce(&[u8]) -> Result<R>) -> Result<R> {
-        if len > self.unread() {
-            error!("buffer: tried to read more data than available");
-            return Err(UsbError::InvalidState);
-        }
-
-        let buf = self.store.get(self.read_ptr..self.read_ptr + len).unwrap();
-
-        let r = f(buf)?;
-        self.read_ptr += len;
-        Ok(r)
-    }
-}
-impl Default for RWBuffer {
-    fn default() -> Self {
-        Self {
-            store: [0; NTB_MAX_SIZE_USIZE],
-            read_ptr: Default::default(),
-            write_ptr: Default::default(),
-        }
-    }
 }
 
 struct NcmOut<'a, B: UsbBus> {
     read_ep: EndpointOut<'a, B>,
-    read_ntb_buffer: [u8; NTB_MAX_SIZE_USIZE],
-    read_ntb_size: usize,
-    read_ntb_idx: Option<usize>,
+    buffer: RWBuffer<NTB_MAX_SIZE_USIZE>,
+    // Reduce to flag/enum?
+    datagram_len: Option<usize>,
 }
 
 impl<'a, B: UsbBus> CdcNcmClass<'a, B> {
@@ -131,13 +70,13 @@ impl<'a, B: UsbBus> CdcNcmClass<'a, B> {
             },
             ncm_out: NcmOut {
                 read_ep: alloc.bulk(max_packet_size),
-                read_ntb_buffer: [0; NTB_MAX_SIZE_USIZE],
-                read_ntb_size: 0,
-                read_ntb_idx: None,
+                buffer: RWBuffer::default(),
+                datagram_len: None,
             },
         }
     }
 
+    // todo: implement connection speed changes
     pub fn connect(&mut self) -> Result<()> {
         const REQ_TYPE_DEVICE_TO_HOST: u8 = 0xA1;
         const NETWORK_CONNECTION_CONNECTED: u8 = 0x01;
@@ -224,11 +163,13 @@ impl<'a, B: UsbBus> NcmIn<'a, B> {
             buf.put_u16_le(0x0000); // wZeroLength
 
             assert!(!buf.has_remaining_mut());
-            Ok(())
+            Ok((OUT_HEADER_LEN.into(), ()))
         })?;
 
         // Write the datagram
-        let result = self.buffer.write(len.into(), |buf| Ok(f(buf)))?;
+        let (_, result) = self
+            .buffer
+            .write(len.into(), |buf| Ok((len.into(), f(buf))))?;
 
         match self.write_packet() {
             Err(UsbError::WouldBlock) | Ok(_) => Ok(result),
@@ -252,24 +193,22 @@ impl<'a, B: UsbBus> NcmIn<'a, B> {
             self.write_ep.write(&[])?;
             // TODO Handle errors
             self.buffer.clear();
-            debug!("sent ZLP");
             Ok(())
         }
         // Full packet
         else if self.buffer.unread() >= MAX_PACKET_SIZE {
-            self.buffer
-                .read(MAX_PACKET_SIZE, |data| self.write_ep.write(data))?;
+            self.buffer.read(MAX_PACKET_SIZE, |data| {
+                self.write_ep.write(data).map(|r| (MAX_PACKET_SIZE, r))
+            })?;
             // TODO Handle errors
-            debug!("sent FLP");
-
             Err(UsbError::WouldBlock)
         } else {
             // Short packet
+            let len = self.buffer.unread();
             self.buffer
-                .read(self.buffer.unread(), |data| self.write_ep.write(data))?;
+                .read(len, |data| self.write_ep.write(data).map(|r| (len, r)))?;
             // TODO handle errors
             self.buffer.clear();
-            debug!("sent SLP");
             Ok(())
         }
     }
@@ -281,23 +220,31 @@ impl<'a, B: UsbBus> NcmIn<'a, B> {
 }
 
 impl<'a, B: UsbBus> NcmOut<'a, B> {
+    fn can_read(&mut self) -> bool {
+        match self.read_packet() {
+            Ok(_) => self.datagram_len.is_some(),
+            Err(_) => false,
+        }
+    }
+
     fn read_datagram<R, F>(&mut self, f: F) -> Result<R>
     where
         F: FnOnce(&mut [u8]) -> R,
     {
         if !self.can_read() {
-            debug!("can't read");
             return Err(UsbError::WouldBlock);
         }
 
-        let result = if let Some(idx) = self.read_ntb_idx {
+        let result = if let Some(datagram_len) = self.datagram_len {
             // Read the datagram
-            f(&mut self.read_ntb_buffer[idx..self.read_ntb_size])
+            self.buffer
+                .read(datagram_len, |data| Ok((datagram_len, f(data))))?
+                .1
         } else {
             return Err(UsbError::WouldBlock);
         };
-        self.read_ntb_idx = None;
-        self.read_ntb_size = 0;
+        self.datagram_len = None;
+        self.buffer.clear();
 
         match self.read_packet() {
             Err(UsbError::WouldBlock) | Ok(_) => Ok(result),
@@ -308,93 +255,103 @@ impl<'a, B: UsbBus> NcmOut<'a, B> {
     /// Reads a single packet from the OUT endpoint.
     pub fn read_packet(&mut self) -> Result<()> {
         const NTB_HEADER_LEN: usize = 12;
+        const NDP_LEN: usize = 12;
 
-        if self.read_ntb_idx.is_some() {
+        if self.datagram_len.is_some() {
             return Ok(());
         }
 
-        let n = self
-            .read_ep
-            .read(&mut self.read_ntb_buffer[self.read_ntb_size..])?;
-        self.read_ntb_size += n;
+        let (read, _) = self
+            .buffer
+            .write(self.read_ep.max_packet_size().into(), |data| {
+                Ok((self.read_ep.read(data)?, ()))
+            })?;
 
-        if n == usize::from(self.read_ep.max_packet_size())
-            && self.read_ntb_size <= NTB_MAX_SIZE_USIZE
-        {
+        if read == self.read_ep.max_packet_size().into() && !self.buffer.is_full() {
             return Err(UsbError::WouldBlock);
         }
-
-        let ntb = &self.read_ntb_buffer[..self.read_ntb_size];
 
         // Process NTB header
-        let Some(mut ntb_header) = ntb.get(..NTB_HEADER_LEN)
-        else {
-            warn!("Received too short NTB");
-            self.read_ntb_size = 0;
-            return Err(UsbError::ParseError);
+        let ndp_offset = match self.buffer.read(NTB_HEADER_LEN, |data| {
+            let mut data: &[u8] = data;
+            let sig = data.get_slice(4);
+            if sig != SIG_NTH {
+                warn!("ncm: received bad NTH sig.");
+                return Err(UsbError::ParseError);
+            }
+
+            data.advance(6); // wHeaderLength, wSequence, wBlockLength
+            let ndp_idx = usize::from(data.get_u16_le());
+            assert!(!data.has_remaining());
+            Ok((NTB_HEADER_LEN, ndp_idx - NTB_HEADER_LEN))
+        }) {
+            Ok((_, ndp_offset)) => ndp_offset,
+            Err(UsbError::InvalidState) => {
+                error!("ntb: read NTB header too short NTB");
+                self.buffer.clear();
+                return Err(UsbError::ParseError);
+            }
+            Err(e) => {
+                self.buffer.clear();
+                return Err(e);
+            }
         };
-        let sig = ntb_header.get_slice(4);
-        if sig != SIG_NTH {
-            warn!("Received bad NTH sig.");
-            self.read_ntb_size = 0;
-            return Err(UsbError::ParseError);
-        }
-        ntb_header.advance(6); // wHeaderLength, wSequence, wBlockLength
-        let ndp_idx = usize::from(ntb_header.get_u16_le());
-        assert!(!ntb_header.has_remaining());
 
         // Process NTB Datagram Pointer
-        let Some(mut ntb_datagram_pointer) = ntb.get(ndp_idx..NTB_HEADER_LEN + ndp_idx)
-        else {
-                warn!("NTH has an NDP pointer out of range.");
-                self.read_ntb_size = 0;
+
+        match self.buffer.read(self.buffer.unread(), |data| {
+            let Some(mut ntb_datagram_pointer) = data.get(ndp_offset..ndp_offset + NDP_LEN)
+            else {
+                    warn!("ncm: NTB datagram pointer out of range or truncated");
+                    return Err(UsbError::ParseError);
+            };
+
+            // wdSignature
+            let sig = ntb_datagram_pointer.get_slice(4);
+            if sig != SIG_NDP_NO_FCS && sig != SIG_NDP_WITH_FCS {
+                warn!("ncm: received bad NDP sig");
                 return Err(UsbError::ParseError);
+            }
+
+            ntb_datagram_pointer.advance(4); // wLength, reserved
+
+            let datagram_index = usize::from(ntb_datagram_pointer.get_u16_le());
+            let datagram_len = usize::from(ntb_datagram_pointer.get_u16_le());
+
+            if datagram_index == 0 || datagram_len == 0 {
+                // empty, ignore. This is allowed by the spec, so don't warn.
+                debug!("ncm: empty datagram");
+                return Err(UsbError::WouldBlock);
+            }
+
+            let datagram_offset = datagram_index - NTB_HEADER_LEN;
+
+            if data
+                .get(datagram_offset..datagram_offset + datagram_len)
+                .is_none()
+            {
+                warn!("ncm: NDP datagram pointer out of range");
+                return Err(UsbError::ParseError);
+            };
+
+            // mark all data up to the datagram_offset as read
+            Ok((datagram_offset, datagram_len))
+        }) {
+            Ok((_, len)) => {
+                self.datagram_len = Some(len);
+            }
+            Err(e) => {
+                self.buffer.clear();
+                return Err(e);
+            }
         };
 
-        // wdSignature
-        let sig = ntb_datagram_pointer.get_slice(4);
-        if sig != SIG_NDP_NO_FCS && sig != SIG_NDP_WITH_FCS {
-            warn!("Received bad NDP sig.");
-            self.read_ntb_size = 0;
-            return Err(UsbError::ParseError);
-        }
-
-        ntb_datagram_pointer.advance(4); // wLength, reserved
-
-        let datagram_index = usize::from(ntb_datagram_pointer.get_u16_le());
-        let datagram_len = usize::from(ntb_datagram_pointer.get_u16_le());
-
-        if datagram_index == 0 || datagram_len == 0 {
-            // empty, ignore. This is allowed by the spec, so don't warn.
-            self.read_ntb_size = 0;
-            debug!("empty datagram");
-            return Err(UsbError::WouldBlock);
-        }
-
-        if ntb
-            .get(datagram_index..datagram_index + datagram_len)
-            .is_none()
-        {
-            warn!("NDP has a datagram pointer out of range.");
-            self.read_ntb_size = 0;
-
-            return Err(UsbError::ParseError);
-        };
-
-        self.read_ntb_idx = Some(datagram_index);
         Ok(())
     }
 
-    fn can_read(&mut self) -> bool {
-        match self.read_packet() {
-            Ok(_) => self.read_ntb_idx.is_some(),
-            Err(_) => false,
-        }
-    }
-
     fn reset(&mut self) {
-        self.read_ntb_size = 0;
-        self.read_ntb_idx = None;
+        self.buffer.clear();
+        self.datagram_len = None;
     }
 }
 
@@ -629,7 +586,6 @@ impl<B: UsbBus> UsbClass<B> for CdcNcmClass<'_, B> {
                         self.state = State::Disabled;
                         info!("ncm: data interface disabled");
                         self.reset();
-                        // TODO reset device as per 7.2
                     } else if req.value == 1 {
                         info!("ncm: data interface enabled");
                         self.state = State::Enabled;
@@ -709,7 +665,7 @@ impl<'a, B: UsbBus> Device for CdcNcmClass<'a, B> {
 
     fn capabilities(&self) -> smoltcp::phy::DeviceCapabilities {
         let mut caps = DeviceCapabilities::default();
-        caps.max_transmission_unit = 1500; // TODO where should this number come from?
+        caps.max_transmission_unit = 1500; // TODO where should this number come from? Look at smoltcp docs
         caps.max_burst_size = Some(1);
         caps.medium = Medium::Ethernet;
         caps
