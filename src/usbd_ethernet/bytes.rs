@@ -64,6 +64,7 @@ impl BufMut for &mut [u8] {
 
     fn put_slice(&mut self, src: &[u8]) {
         self[..src.len()].copy_from_slice(src);
+        // use mem::take to make lifetimes happy
         let (_, b) = core::mem::take(self).split_at_mut(src.len());
         *self = b;
     }

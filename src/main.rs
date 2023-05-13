@@ -6,7 +6,6 @@
 #![allow(clippy::module_name_repetitions)]
 #![allow(clippy::missing_errors_doc)]
 #![allow(clippy::missing_panics_doc)]
-#![allow(clippy::struct_excessive_bools)]
 #![warn(clippy::use_self)]
 
 use core::str::from_utf8;
@@ -19,6 +18,7 @@ use hal::{clocks::init_clocks_and_plls, pac, watchdog::Watchdog};
 use heapless::Vec;
 use panic_probe as _;
 use rp_pico as bsp;
+use smoltcp::wire::DhcpOption;
 use smoltcp::{
     iface::{Config, Interface, SocketSet},
     socket::{dhcpv4, tcp},
@@ -37,6 +37,7 @@ mod usbd_ethernet;
 
 const HOST_MAC_ADDR: [u8; 6] = [0x88, 0x88, 0x88, 0x88, 0x88, 0x88];
 const DEVICE_MAC_ADDR: [u8; 6] = [0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC];
+const HOST_NAME: &[u8] = b"pico";
 
 #[entry]
 fn main() -> ! {
@@ -90,9 +91,15 @@ fn main() -> ! {
     let mut iface = Interface::new(config, &mut cdc_ncm);
 
     // Create sockets
-    let dhcp_socket = dhcpv4::Socket::new();
+    let mut dhcp_socket = dhcpv4::Socket::new();
 
-    let server_socket = {
+    // register hostname with dhcp
+    dhcp_socket.set_outgoing_options(&[DhcpOption {
+        kind: 12, // Host Name
+        data: HOST_NAME,
+    }]);
+
+    let telnet_socket = {
         // It is not strictly necessary to use a `static mut` and unsafe code here, but
         // on embedded systems that smoltcp targets it is far better to allocate the data
         // statically to verify that it fits into RAM rather than get undefined behavior
@@ -104,9 +111,22 @@ fn main() -> ! {
         tcp::Socket::new(tcp_receive_buffer, tcp_transmit_buffer)
     };
 
-    let mut sockets: [_; 2] = Default::default();
+    let http_socket = {
+        // It is not strictly necessary to use a `static mut` and unsafe code here, but
+        // on embedded systems that smoltcp targets it is far better to allocate the data
+        // statically to verify that it fits into RAM rather than get undefined behavior
+        // when stack overflows.
+        static mut TCP_SERVER_RX_DATA: [u8; 1024] = [0; 1024];
+        static mut TCP_SERVER_TX_DATA: [u8; 1024] = [0; 1024];
+        let tcp_receive_buffer = tcp::SocketBuffer::new(unsafe { &mut TCP_SERVER_RX_DATA[..] });
+        let tcp_transmit_buffer = tcp::SocketBuffer::new(unsafe { &mut TCP_SERVER_TX_DATA[..] });
+        tcp::Socket::new(tcp_receive_buffer, tcp_transmit_buffer)
+    };
+
+    let mut sockets: [_; 3] = Default::default();
     let mut sockets = SocketSet::new(&mut sockets[..]);
-    let server_handle = sockets.add(server_socket);
+    let telnet_handle = sockets.add(telnet_socket);
+    let http_handle = sockets.add(http_socket);
     let dhcp_handle = sockets.add(dhcp_socket);
 
     loop {
@@ -118,7 +138,8 @@ fn main() -> ! {
             let timestamp =
                 Instant::from_micros(i64::try_from(timer.get_counter().ticks()).unwrap());
             if iface.poll(timestamp, &mut cdc_ncm, &mut sockets) {
-                server_poll(sockets.get_mut::<tcp::Socket>(server_handle));
+                telnet_poll(sockets.get_mut::<tcp::Socket>(telnet_handle));
+                http_poll(sockets.get_mut::<tcp::Socket>(http_handle));
                 dhcp_poll(&mut iface, sockets.get_mut::<dhcpv4::Socket>(dhcp_handle));
             }
         }
@@ -133,10 +154,10 @@ fn generate_random_seed(ring_oscillator: &RingOscillator<hal::rosc::Enabled>) ->
     seed
 }
 
-fn server_poll(socket: &mut tcp::Socket) {
+fn telnet_poll(socket: &mut tcp::Socket) {
     if !socket.is_open() {
-        socket.listen(1234).unwrap();
-        debug!("listening on 1234");
+        socket.listen(22).unwrap();
+        debug!("telnet: listening on 22");
     }
 
     if socket.may_recv() {
@@ -145,9 +166,9 @@ fn server_poll(socket: &mut tcp::Socket) {
             .recv(|buffer| {
                 if !buffer.is_empty() {
                     if let Ok(s) = from_utf8(buffer) {
-                        debug!("recv data: {:?}", s);
+                        debug!("telnet: recv data: {:?}", s);
                     } else {
-                        debug!("recv data: {:?}", buffer);
+                        debug!("telnet: recv data: {:?}", buffer);
                     }
                 }
                 // Echo the data back in upper case
@@ -159,7 +180,88 @@ fn server_poll(socket: &mut tcp::Socket) {
             socket.send_slice(&data[..]).unwrap();
         }
     } else if socket.may_send() {
-        debug!("socket close");
+        debug!("telnet: socket close");
+        socket.close();
+    }
+}
+
+enum HttpRequest {
+    Get,
+    Unknown,
+    ClientError,
+}
+
+fn http_poll(socket: &mut tcp::Socket) {
+    if !socket.is_open() {
+        socket.listen(80).unwrap();
+        debug!("http: listening on 80");
+    }
+
+    if socket.may_recv() {
+        let request = socket
+            .recv(|buffer| {
+                let request = if buffer.is_empty() {
+                    None
+                } else if let Ok(s) = from_utf8(buffer) {
+                    debug!("http: recv data: {:?}", s);
+
+                    if s.starts_with("GET / HTTP/1.1") {
+                        debug!("http: recv get /");
+                        Some(HttpRequest::Get)
+                    } else {
+                        debug!("http: recv unknown");
+                        Some(HttpRequest::Unknown)
+                    }
+                } else {
+                    debug!("http: recv data: {:?}", buffer);
+                    Some(HttpRequest::ClientError)
+                };
+                (buffer.len(), request)
+            })
+            .unwrap();
+        if socket.can_send() && request.is_some() {
+            match request {
+                Some(HttpRequest::Get) => {
+                    socket
+                        .send_slice(
+                            b"HTTP/1.1 200 OK
+Connection: close
+Content-Length: 53
+Content-Type: text/html
+
+<!DOCTYPE html>
+<html><body>Hello pico!</body></html>",
+                        )
+                        .unwrap();
+                }
+
+                Some(HttpRequest::Unknown) => {
+                    socket
+                        .send_slice(
+                            b"HTTP/1.1 404 Not Found
+Connection: close
+Content-Length: 0
+
+",
+                        )
+                        .unwrap();
+                }
+                Some(HttpRequest::ClientError) => {
+                    socket
+                        .send_slice(
+                            b"HTTP/1.1 400 Bad Request
+Connection: close
+Content-Length: 0
+
+",
+                        )
+                        .unwrap();
+                }
+                None => {}
+            }
+        }
+    } else if socket.may_send() {
+        debug!("http: socket close");
         socket.close();
     }
 }
@@ -169,7 +271,7 @@ fn dhcp_poll(iface: &mut Interface, socket: &mut dhcpv4::Socket) {
     match event {
         None => {}
         Some(dhcpv4::Event::Configured(config)) => {
-            debug!("ncm: DHCP configured");
+            debug!("dhcp: DHCP configured");
 
             debug!("     IP address:      {}", config.address);
             set_ipv4_addr(iface, config.address);
@@ -187,7 +289,7 @@ fn dhcp_poll(iface: &mut Interface, socket: &mut dhcpv4::Socket) {
             }
         }
         Some(dhcpv4::Event::Deconfigured) => {
-            debug!("ncm: DHCP deconfigured");
+            debug!("dhcp: DHCP deconfigured");
             set_ipv4_addr(iface, Ipv4Cidr::new(Ipv4Address::UNSPECIFIED, 0));
             iface.routes_mut().remove_default_ipv4_route();
         }

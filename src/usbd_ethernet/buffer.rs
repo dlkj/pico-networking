@@ -3,6 +3,7 @@ use defmt::error;
 use usb_device::Result;
 use usb_device::UsbError;
 
+// TODO add the ability to freeze the buffer to make read and write exclusive
 pub(crate) struct RWBuffer<const LEN: usize> {
     store: [u8; LEN],
     read_ptr: usize,
