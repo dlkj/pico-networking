@@ -7,6 +7,21 @@ use smoltcp::phy::{self, Device, DeviceCapabilities, Medium};
 use usb_device::class_prelude::*;
 use usb_device::Result;
 
+/*
+ * References:
+ *   - Universal Serial Bus Communications Class Subclass Specifications for Network
+ *     Control Model Devices - Revision 1.0 (Errata 1) - November 24, 2010
+ *   - Universal Serial Bus Class Definitions for Communications Devices  - Revision
+ *     1.2 (Errata 1) - November 3, 2010
+ *   - Universal Serial Bus Communications Class Subclass Specification for Ethernet
+ *     Control Model Devices - Revision 1.2 - February 9, 2007
+ *
+ * Acknowledgement to:
+ *   - TinyUSB:     https://github.com/hathach/tinyusb
+ *   - embassy-usb: https://github.com/embassy-rs/embassy/tree/master/embassy-usb
+ *   - usbd-serial: https://github.com/rust-embedded-community/usbd-serial
+ */
+
 /// This should be used as `device_class` when building the `UsbDevice`.
 pub const USB_CLASS_CDC: u8 = 0x02;
 
@@ -17,8 +32,6 @@ const MAX_SEGMENT_SIZE: u16 = 1514;
 const SIG_NTH: &[u8; 4] = b"NCMH";
 const SIG_NDP_NO_FCS: &[u8; 4] = b"NCM0";
 const SIG_NDP_WITH_FCS: &[u8; 4] = b"NCM1";
-
-const MAX_PACKET_SIZE: usize = 64; // TODO change to type level generics
 
 #[derive(Format, PartialEq, Eq, Clone, Copy)]
 pub enum State {
@@ -48,7 +61,6 @@ struct NcmIn<'a, B: UsbBus> {
 struct NcmOut<'a, B: UsbBus> {
     read_ep: EndpointOut<'a, B>,
     buffer: RWBuffer<NTB_MAX_SIZE_USIZE>,
-    // Reduce to flag/enum?
     datagram_len: Option<usize>,
 }
 
@@ -76,7 +88,7 @@ impl<'a, B: UsbBus> CdcNcmClass<'a, B> {
         }
     }
 
-    // todo: implement connection speed changes
+    // TODO: implement connection speed changes
     pub fn connect(&mut self) -> Result<()> {
         const REQ_TYPE_DEVICE_TO_HOST: u8 = 0xA1;
         const NETWORK_CONNECTION_CONNECTED: u8 = 0x01;
@@ -185,31 +197,52 @@ impl<'a, B: UsbBus> NcmIn<'a, B> {
     }
 
     fn write_packet(&mut self) -> Result<()> {
+        let max_packet_size = self.write_ep.max_packet_size().into();
+
         if self.buffer.is_empty() {
+            // No data to send
             Ok(())
-        }
-        // ZLP if % MAX_PACKET_SIZE
-        else if !self.buffer.has_unread() {
-            self.write_ep.write(&[])?;
-            // TODO Handle errors
-            self.buffer.clear();
-            Ok(())
-        }
-        // Full packet
-        else if self.buffer.unread() >= MAX_PACKET_SIZE {
-            self.buffer.read(MAX_PACKET_SIZE, |data| {
-                self.write_ep.write(data).map(|r| (MAX_PACKET_SIZE, r))
-            })?;
-            // TODO Handle errors
-            Err(UsbError::WouldBlock)
+        } else if !self.buffer.has_unread() {
+            // Zero length packet
+            match self.write_ep.write(&[]) {
+                Ok(_) => {
+                    self.buffer.clear();
+                    Ok(())
+                }
+                Err(UsbError::WouldBlock) => return Err(UsbError::WouldBlock),
+                Err(e) => {
+                    self.buffer.clear();
+                    Err(e)
+                }
+            }
+        } else if self.buffer.unread() >= max_packet_size {
+            // Full packet
+            match self.buffer.read(max_packet_size, |data| {
+                self.write_ep.write(data).map(|r| (max_packet_size, r))
+            }) {
+                Ok(_) | Err(UsbError::WouldBlock) => Err(UsbError::WouldBlock),
+                Err(err) => {
+                    self.buffer.clear();
+                    return Err(err);
+                }
+            }
         } else {
             // Short packet
             let len = self.buffer.unread();
-            self.buffer
-                .read(len, |data| self.write_ep.write(data).map(|r| (len, r)))?;
-            // TODO handle errors
-            self.buffer.clear();
-            Ok(())
+            match self
+                .buffer
+                .read(len, |data| self.write_ep.write(data).map(|r| (len, r)))
+            {
+                Ok(_) => {
+                    self.buffer.clear();
+                    Ok(())
+                }
+                Err(UsbError::WouldBlock) => return Err(UsbError::WouldBlock),
+                Err(e) => {
+                    self.buffer.clear();
+                    Err(e)
+                }
+            }
         }
     }
 
@@ -665,7 +698,7 @@ impl<'a, B: UsbBus> Device for CdcNcmClass<'a, B> {
 
     fn capabilities(&self) -> smoltcp::phy::DeviceCapabilities {
         let mut caps = DeviceCapabilities::default();
-        caps.max_transmission_unit = 1500; // TODO where should this number come from? Look at smoltcp docs
+        caps.max_transmission_unit = MAX_SEGMENT_SIZE.into();
         caps.max_burst_size = Some(1);
         caps.medium = Medium::Ethernet;
         caps
