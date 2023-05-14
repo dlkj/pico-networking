@@ -41,10 +41,18 @@ const HOST_NAME: &[u8] = b"pico";
 
 #[entry]
 fn main() -> ! {
+    static mut TELNET_SOCKET_RX_DATA: [u8; 1024] = [0; 1024];
+    static mut TELNET_SOCKET_TX_DATA: [u8; 1024] = [0; 1024];
+    static mut HTTP_SOCKET_RX_DATA: [u8; 1024] = [0; 1024];
+    static mut HTTP_SOCKET_TX_DATA: [u8; 1024] = [0; 1024];
+    static mut NCM_IN_BUFFER: [u8; 2048] = [0; 2048];
+    static mut NCM_OUT_BUFFER: [u8; 2048] = [0; 2048];
+    static mut TELNET_BUFFER: Vec<u8, 1024> = Vec::new();
+
     let mut pac = pac::Peripherals::take().unwrap();
     let mut watchdog = Watchdog::new(pac.WATCHDOG);
     let timer = Timer::new(pac.TIMER, &mut pac.RESETS);
-    let ring_oscillator = RingOscillator::new(pac.ROSC).initialize();
+    let ring_oscillator = RingOscillator::new(pac.ROSC);
 
     // Prevent https://github.com/rp-rs/rp-hal/issues/606 occurring
     let sio = hal::sio::Sio::new(pac.SIO);
@@ -67,16 +75,17 @@ fn main() -> ! {
     .ok()
     .unwrap();
 
-    let usb_alloc = UsbBusAllocator::new(hal::usb::UsbBus::new(
+    let usb_bus = hal::usb::UsbBus::new(
         pac.USBCTRL_REGS,
         pac.USBCTRL_DPRAM,
         clocks.usb_clock,
         true,
         &mut pac.RESETS,
-    ));
+    );
 
-    let mut cdc_ncm = CdcNcmClass::new(&usb_alloc, HOST_MAC_ADDR, 64);
-
+    let usb_alloc = UsbBusAllocator::new(usb_bus);
+    let mut cdc_ncm =
+        CdcNcmClass::new(&usb_alloc, HOST_MAC_ADDR, 64, NCM_IN_BUFFER, NCM_OUT_BUFFER);
     let mut usb_dev = UsbDeviceBuilder::new(&usb_alloc, UsbVidPid(0x1209, 0x0004))
         .manufacturer("pico-networking")
         .product("usb-ethernet")
@@ -84,11 +93,12 @@ fn main() -> ! {
         .device_class(USB_CLASS_CDC)
         .build();
 
-    let mut config = Config::new();
-    config.hardware_addr = Some(EthernetAddress(DEVICE_MAC_ADDR).into());
-    config.random_seed = generate_random_seed(&ring_oscillator);
+    let mut interface_config = Config::new();
+    interface_config.hardware_addr = Some(EthernetAddress(DEVICE_MAC_ADDR).into());
+    let ring_oscillator = ring_oscillator.initialize();
+    interface_config.random_seed = generate_random_seed(&ring_oscillator);
 
-    let mut iface = Interface::new(config, &mut cdc_ncm);
+    let mut interface = Interface::new(interface_config, &mut cdc_ncm);
 
     // Create sockets
     let mut dhcp_socket = dhcpv4::Socket::new();
@@ -99,29 +109,14 @@ fn main() -> ! {
         data: HOST_NAME,
     }]);
 
-    let telnet_socket = {
-        // It is not strictly necessary to use a `static mut` and unsafe code here, but
-        // on embedded systems that smoltcp targets it is far better to allocate the data
-        // statically to verify that it fits into RAM rather than get undefined behavior
-        // when stack overflows.
-        static mut TCP_SERVER_RX_DATA: [u8; 1024] = [0; 1024];
-        static mut TCP_SERVER_TX_DATA: [u8; 1024] = [0; 1024];
-        let tcp_receive_buffer = tcp::SocketBuffer::new(unsafe { &mut TCP_SERVER_RX_DATA[..] });
-        let tcp_transmit_buffer = tcp::SocketBuffer::new(unsafe { &mut TCP_SERVER_TX_DATA[..] });
-        tcp::Socket::new(tcp_receive_buffer, tcp_transmit_buffer)
-    };
-
-    let http_socket = {
-        // It is not strictly necessary to use a `static mut` and unsafe code here, but
-        // on embedded systems that smoltcp targets it is far better to allocate the data
-        // statically to verify that it fits into RAM rather than get undefined behavior
-        // when stack overflows.
-        static mut TCP_SERVER_RX_DATA: [u8; 1024] = [0; 1024];
-        static mut TCP_SERVER_TX_DATA: [u8; 1024] = [0; 1024];
-        let tcp_receive_buffer = tcp::SocketBuffer::new(unsafe { &mut TCP_SERVER_RX_DATA[..] });
-        let tcp_transmit_buffer = tcp::SocketBuffer::new(unsafe { &mut TCP_SERVER_TX_DATA[..] });
-        tcp::Socket::new(tcp_receive_buffer, tcp_transmit_buffer)
-    };
+    let telnet_socket = tcp::Socket::new(
+        tcp::SocketBuffer::new(&mut TELNET_SOCKET_RX_DATA[..]),
+        tcp::SocketBuffer::new(&mut TELNET_SOCKET_TX_DATA[..]),
+    );
+    let http_socket = tcp::Socket::new(
+        tcp::SocketBuffer::new(&mut HTTP_SOCKET_RX_DATA[..]),
+        tcp::SocketBuffer::new(&mut HTTP_SOCKET_TX_DATA[..]),
+    );
 
     let mut sockets: [_; 3] = Default::default();
     let mut sockets = SocketSet::new(&mut sockets[..]);
@@ -135,12 +130,17 @@ fn main() -> ! {
         }
 
         if cdc_ncm.state() == State::Connected {
+            // panic safety - will take 292_277 years to overflow at one tick per microsecond
             let timestamp =
                 Instant::from_micros(i64::try_from(timer.get_counter().ticks()).unwrap());
-            if iface.poll(timestamp, &mut cdc_ncm, &mut sockets) {
-                telnet_poll(sockets.get_mut::<tcp::Socket>(telnet_handle));
+
+            if interface.poll(timestamp, &mut cdc_ncm, &mut sockets) {
+                telnet_poll(sockets.get_mut::<tcp::Socket>(telnet_handle), TELNET_BUFFER);
                 http_poll(sockets.get_mut::<tcp::Socket>(http_handle));
-                dhcp_poll(&mut iface, sockets.get_mut::<dhcpv4::Socket>(dhcp_handle));
+                dhcp_poll(
+                    &mut interface,
+                    sockets.get_mut::<dhcpv4::Socket>(dhcp_handle),
+                );
             }
         }
     }
@@ -154,30 +154,31 @@ fn generate_random_seed(ring_oscillator: &RingOscillator<hal::rosc::Enabled>) ->
     seed
 }
 
-fn telnet_poll(socket: &mut tcp::Socket) {
+fn telnet_poll<const LEN: usize>(socket: &mut tcp::Socket, buffer: &mut Vec<u8, LEN>) {
+    buffer.clear();
+
     if !socket.is_open() {
         socket.listen(22).unwrap();
         debug!("telnet: listening on 22");
     }
 
     if socket.may_recv() {
-        let mut data = Vec::<u8, 1024>::new();
         socket
-            .recv(|buffer| {
-                if !buffer.is_empty() {
-                    if let Ok(s) = from_utf8(buffer) {
+            .recv(|data| {
+                if !data.is_empty() {
+                    if let Ok(s) = from_utf8(data) {
                         debug!("telnet: recv data: {:?}", s);
                     } else {
-                        debug!("telnet: recv data: {:?}", buffer);
+                        debug!("telnet: recv data: {:?}", data);
                     }
                 }
                 // Echo the data back in upper case
-                data.extend(buffer.iter().copied().map(|c| c.to_ascii_uppercase()));
+                buffer.extend(data.iter().copied().map(|c| c.to_ascii_uppercase()));
                 (buffer.len(), ())
             })
             .unwrap();
-        if socket.can_send() && !data.is_empty() {
-            socket.send_slice(&data[..]).unwrap();
+        if socket.can_send() && !buffer.is_empty() {
+            socket.send_slice(&buffer[..]).unwrap();
         }
     } else if socket.may_send() {
         debug!("telnet: socket close");

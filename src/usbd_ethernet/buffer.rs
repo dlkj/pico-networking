@@ -4,12 +4,20 @@ use usb_device::Result;
 use usb_device::UsbError;
 
 // TODO add the ability to freeze the buffer to make read and write exclusive
-pub(crate) struct RWBuffer<const LEN: usize> {
-    store: [u8; LEN],
+pub(crate) struct RWBuffer<'a, const LEN: usize> {
+    store: &'a mut [u8; LEN],
     read_ptr: usize,
     write_ptr: usize,
 }
-impl<const LEN: usize> RWBuffer<LEN> {
+impl<'a, const LEN: usize> RWBuffer<'a, LEN> {
+    pub fn new(store: &'a mut [u8; LEN]) -> Self {
+        Self {
+            store,
+            read_ptr: Default::default(),
+            write_ptr: Default::default(),
+        }
+    }
+
     pub const fn capacity(&self) -> usize {
         self.store.len()
     }
@@ -77,14 +85,5 @@ impl<const LEN: usize> RWBuffer<LEN> {
         }
         self.read_ptr += read;
         Ok((read, r))
-    }
-}
-impl<const LEN: usize> Default for RWBuffer<LEN> {
-    fn default() -> Self {
-        Self {
-            store: [0; LEN],
-            read_ptr: Default::default(),
-            write_ptr: Default::default(),
-        }
     }
 }

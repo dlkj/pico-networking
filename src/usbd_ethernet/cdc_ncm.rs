@@ -54,18 +54,24 @@ pub struct CdcNcmClass<'a, B: UsbBus> {
 
 struct NcmIn<'a, B: UsbBus> {
     write_ep: EndpointIn<'a, B>,
-    buffer: RWBuffer<NTB_MAX_SIZE_USIZE>,
+    buffer: RWBuffer<'a, NTB_MAX_SIZE_USIZE>,
     next_seq: u16,
 }
 
 struct NcmOut<'a, B: UsbBus> {
     read_ep: EndpointOut<'a, B>,
-    buffer: RWBuffer<NTB_MAX_SIZE_USIZE>,
+    buffer: RWBuffer<'a, NTB_MAX_SIZE_USIZE>,
     datagram_len: Option<usize>,
 }
 
 impl<'a, B: UsbBus> CdcNcmClass<'a, B> {
-    pub fn new(alloc: &'a UsbBusAllocator<B>, mac_address: [u8; 6], max_packet_size: u16) -> Self {
+    pub fn new(
+        alloc: &'a UsbBusAllocator<B>,
+        mac_address: [u8; 6],
+        max_packet_size: u16,
+        in_buffer: &'a mut [u8; NTB_MAX_SIZE_USIZE],
+        out_buffer: &'a mut [u8; NTB_MAX_SIZE_USIZE],
+    ) -> Self {
         let mac_address_idx = alloc.string();
 
         Self {
@@ -77,12 +83,12 @@ impl<'a, B: UsbBus> CdcNcmClass<'a, B> {
             state: State::Disabled,
             ncm_in: NcmIn {
                 write_ep: alloc.bulk(max_packet_size),
-                buffer: RWBuffer::default(),
+                buffer: RWBuffer::new(in_buffer),
                 next_seq: 0,
             },
             ncm_out: NcmOut {
                 read_ep: alloc.bulk(max_packet_size),
-                buffer: RWBuffer::default(),
+                buffer: RWBuffer::new(out_buffer),
                 datagram_len: None,
             },
         }
