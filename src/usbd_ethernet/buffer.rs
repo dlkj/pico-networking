@@ -68,6 +68,7 @@ impl<'a, const LEN: usize> RWBuffer<'a, LEN> {
         len: usize,
         f: impl FnOnce(&mut [u8]) -> Result<(usize, R)>,
     ) -> Result<(usize, R)> {
+        // Todo combine with unwrap below
         if len > self.unread() {
             error!("buffer: tried to read more data than available");
             return Err(UsbError::InvalidState);

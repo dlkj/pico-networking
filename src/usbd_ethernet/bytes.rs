@@ -33,6 +33,7 @@ pub(crate) trait Buf {
 
     fn get_slice(&mut self, size: usize) -> &[u8];
 
+    // Todo expose errors
     fn get_u8(&mut self) -> u8 {
         const SIZE: usize = core::mem::size_of::<u8>();
         let value = self.chunk().first().copied().unwrap();
@@ -40,6 +41,7 @@ pub(crate) trait Buf {
         value
     }
 
+    // Todo expose errors
     fn get_u16_le(&mut self) -> u16 {
         const SIZE: usize = core::mem::size_of::<u16>();
         let int_bytes = self.chunk().get(..SIZE).unwrap();
@@ -48,6 +50,7 @@ pub(crate) trait Buf {
         value
     }
 
+    // Todo expose errors
     fn get_u32_le(&mut self) -> u32 {
         const SIZE: usize = core::mem::size_of::<u32>();
         let int_bytes = self.chunk().get(..SIZE).unwrap();
