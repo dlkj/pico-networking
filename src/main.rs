@@ -12,7 +12,7 @@ use core::str::from_utf8;
 
 use bsp::entry;
 use bsp::hal::{self, rosc::RingOscillator, Timer};
-use defmt::{debug, warn};
+use defmt::{debug, error, warn};
 use defmt_rtt as _;
 use hal::{clocks::init_clocks_and_plls, pac, watchdog::Watchdog};
 use heapless::Vec;
@@ -30,7 +30,7 @@ use usb_device::class_prelude::*;
 use usb_device::prelude::*;
 
 use crate::usbd_ethernet::cdc_ncm::CdcNcmClass;
-use crate::usbd_ethernet::cdc_ncm::State;
+use crate::usbd_ethernet::cdc_ncm::DeviceState;
 use crate::usbd_ethernet::cdc_ncm::USB_CLASS_CDC;
 
 mod usbd_ethernet;
@@ -53,15 +53,6 @@ fn main() -> ! {
     let mut watchdog = Watchdog::new(pac.WATCHDOG);
     let timer = Timer::new(pac.TIMER, &mut pac.RESETS);
     let ring_oscillator = RingOscillator::new(pac.ROSC);
-
-    // Prevent https://github.com/rp-rs/rp-hal/issues/606 occurring
-    let sio = hal::sio::Sio::new(pac.SIO);
-    let _pins = hal::gpio::Pins::new(
-        pac.IO_BANK0,
-        pac.PADS_BANK0,
-        sio.gpio_bank0,
-        &mut pac.RESETS,
-    );
 
     let clocks = init_clocks_and_plls(
         bsp::XOSC_CRYSTAL_FREQ,
@@ -99,6 +90,11 @@ fn main() -> ! {
     interface_config.random_seed = generate_random_seed(&ring_oscillator);
 
     let mut interface = Interface::new(interface_config, &mut cdc_ncm);
+    interface.update_ip_addrs(|ip_addrs| {
+        ip_addrs
+            .push(Ipv4Cidr::new(Ipv4Address::UNSPECIFIED, 0).into())
+            .unwrap();
+    });
 
     // Create sockets
     let mut dhcp_socket = dhcpv4::Socket::new();
@@ -125,11 +121,22 @@ fn main() -> ! {
     let dhcp_handle = sockets.add(dhcp_socket);
 
     loop {
-        if usb_dev.poll(&mut [&mut cdc_ncm]) && cdc_ncm.state() == State::Enabled {
-            let _: usb_device::Result<()> = cdc_ncm.connect();
+        if usb_dev.poll(&mut [&mut cdc_ncm]) && cdc_ncm.state() == DeviceState::Disconnected {
+            if cdc_ncm.connection_speed().is_none() {
+                // 1000 Kps upload and download
+                match cdc_ncm.set_connection_speed(1_000_000, 1_000_000) {
+                    Ok(_) | Err(UsbError::WouldBlock) => {}
+                    Err(e) => error!("Failed to set connection speed: {}", e),
+                }
+            } else {
+                match cdc_ncm.connect() {
+                    Ok(_) | Err(UsbError::WouldBlock) => {}
+                    Err(e) => error!("Failed to connect: {}", e),
+                }
+            }
         }
 
-        if cdc_ncm.state() == State::Connected {
+        if cdc_ncm.state() == DeviceState::Connected {
             // panic safety - will take 292_277 years to overflow at one tick per microsecond
             let timestamp =
                 Instant::from_micros(i64::try_from(timer.get_counter().ticks()).unwrap());
@@ -299,13 +306,7 @@ fn dhcp_poll(iface: &mut Interface, socket: &mut dhcpv4::Socket) {
 
 fn set_ipv4_addr(iface: &mut Interface, cidr: Ipv4Cidr) {
     iface.update_ip_addrs(|addrs| {
-        if let Some(a) = addrs
-            .iter_mut()
-            .find(|addr| matches!(addr, IpCidr::Ipv4(_)))
-        {
-            *a = IpCidr::Ipv4(cidr);
-        } else {
-            addrs.push(IpCidr::Ipv4(cidr)).unwrap();
-        }
+        let dest = addrs.iter_mut().next().unwrap();
+        *dest = IpCidr::Ipv4(cidr);
     });
 }

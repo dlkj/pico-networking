@@ -33,12 +33,31 @@ const SIG_NTH: &[u8; 4] = b"NCMH";
 const SIG_NDP_NO_FCS: &[u8; 4] = b"NCM0";
 const SIG_NDP_WITH_FCS: &[u8; 4] = b"NCM1";
 
+const REQ_TYPE_DEVICE_TO_HOST: u8 = 0xA1;
+
 #[derive(Format, PartialEq, Eq, Clone, Copy)]
-pub enum State {
+pub enum DeviceState {
     Disabled,
-    Enabled,
-    Connecting,
+    Disconnected,
     Connected,
+}
+#[derive(PartialEq, Eq)]
+enum HostNotificationState {
+    Complete,
+    InProgress(HostNotification),
+}
+
+#[derive(PartialEq, Eq)]
+enum HostNotification {
+    Connect,
+    Disconnect,
+    Speed(Speed),
+}
+
+#[derive(Format, PartialEq, Eq, Clone, Copy)]
+pub struct Speed {
+    pub upload_bit_rate: u32,
+    pub download_bit_rate: u32,
 }
 
 pub struct CdcNcmClass<'a, B: UsbBus> {
@@ -47,9 +66,11 @@ pub struct CdcNcmClass<'a, B: UsbBus> {
     data_if: InterfaceNumber,
     mac_address: String<12>,
     mac_address_idx: StringIndex,
-    state: State,
+    state: DeviceState,
+    request_state: HostNotificationState,
     ncm_in: NcmIn<'a, B>,
     ncm_out: NcmOut<'a, B>,
+    connection_speed: Option<Speed>,
 }
 
 struct NcmIn<'a, B: UsbBus> {
@@ -76,11 +97,12 @@ impl<'a, B: UsbBus> CdcNcmClass<'a, B> {
 
         Self {
             comm_if: alloc.interface(),
-            comm_ep: alloc.interrupt(8, 255),
+            comm_ep: alloc.interrupt(16, 255),
             data_if: alloc.interface(),
             mac_address: mac_bytes_to_string(mac_address),
             mac_address_idx,
-            state: State::Disabled,
+            state: DeviceState::Disabled,
+            request_state: HostNotificationState::Complete,
             ncm_in: NcmIn {
                 write_ep: alloc.bulk(max_packet_size),
                 buffer: RWBuffer::new(in_buffer),
@@ -91,43 +113,98 @@ impl<'a, B: UsbBus> CdcNcmClass<'a, B> {
                 buffer: RWBuffer::new(out_buffer),
                 datagram_len: None,
             },
+            connection_speed: None,
         }
     }
 
-    // TODO: implement connection speed changes
     pub fn connect(&mut self) -> Result<()> {
-        const REQ_TYPE_DEVICE_TO_HOST: u8 = 0xA1;
-        const NETWORK_CONNECTION_CONNECTED: u8 = 0x01;
+        self.network_connection_notification(true)
+    }
+
+    pub fn disconnect(&mut self) -> Result<()> {
+        self.network_connection_notification(false)
+    }
+
+    fn network_connection_notification(&mut self, connect: bool) -> Result<()> {
         const NOTE_TYPE_NETWORK_CONNECTION: u8 = 0x00;
 
-        if self.state != State::Enabled {
-            error!(
-                "ncm: state must be Enabled to connect. State: {}",
-                self.state
-            );
-            return Err(UsbError::InvalidState);
+        if self.state != DeviceState::Disconnected {
+            warn!("ncm: device can't change connection state while disconnected",);
+            return Err(UsbError::WouldBlock);
         }
 
-        let result = self.comm_ep.write(&[
-            REQ_TYPE_DEVICE_TO_HOST,      // bmRequestType
-            NOTE_TYPE_NETWORK_CONNECTION, // bNotificationType
-            NETWORK_CONNECTION_CONNECTED, // wValue
-            0x00,
-            self.data_if.into(), // wIndex = interface
-            0x00,
-            0x00, // wLength
-            0x00,
-        ]);
+        if let HostNotificationState::InProgress(_) = self.request_state {
+            return Err(UsbError::WouldBlock);
+        }
+
+        let mut data = [0x00; 8];
+        let mut writer = &mut data[..];
+        writer.put_u8(REQ_TYPE_DEVICE_TO_HOST); // bmRequestType
+        writer.put_u8(NOTE_TYPE_NETWORK_CONNECTION); // bNotificationType
+        writer.put_u16_le(connect.into()); // wValue
+        writer.put_u16_le(u8::from(self.data_if).into()); // wIndex = interface
+        writer.put_u16_le(0x00); // wLength
+        assert!(!writer.has_remaining_mut());
+        let result = self.comm_ep.write(&data);
 
         if result.is_ok() {
-            debug!("ncm: connecting");
-            self.state = State::Connecting;
+            if connect {
+                debug!("ncm: connecting");
+            } else {
+                debug!("ncm: disconnecting");
+            }
+            self.request_state = HostNotificationState::InProgress(HostNotification::Connect);
         }
 
         result.map(drop)
     }
 
-    pub fn state(&self) -> State {
+    pub fn set_connection_speed(
+        &mut self,
+        download_bit_rate: u32,
+        upload_bit_rate: u32,
+    ) -> Result<()> {
+        const NOTE_TYPE_CONNECTION_SPEED_CHANGE: u8 = 0x2A;
+
+        if self.state != DeviceState::Disconnected {
+            warn!("ncm: device can't set connection speed while disconnected",);
+            return Err(UsbError::WouldBlock);
+        }
+
+        if let HostNotificationState::InProgress(_) = self.request_state {
+            return Err(UsbError::WouldBlock);
+        }
+
+        let mut data = [0x00; 16];
+        let mut writer = &mut data[..];
+        writer.put_u8(REQ_TYPE_DEVICE_TO_HOST); // bmRequestType
+        writer.put_u8(NOTE_TYPE_CONNECTION_SPEED_CHANGE); // bNotificationType
+        writer.put_u16_le(0); // wValue
+        writer.put_u16_le(u8::from(self.data_if).into()); // wIndex = interface
+        writer.put_u16_le(0x08); // wLength
+        writer.put_u32_le(download_bit_rate); // data - DLBitRate
+        writer.put_u32_le(upload_bit_rate); // data - ULBitRate
+        assert!(!writer.has_remaining_mut());
+
+        let result = self.comm_ep.write(&data);
+
+        if result.is_ok() {
+            self.request_state =
+                HostNotificationState::InProgress(HostNotification::Speed(Speed {
+                    upload_bit_rate,
+                    download_bit_rate,
+                }));
+            debug!("ncm: setting connection speed");
+        }
+
+        result.map(drop)
+    }
+
+    pub fn connection_speed(&self) -> Option<Speed> {
+        self.connection_speed
+    }
+
+    pub fn state(&self) -> DeviceState {
         self.state
     }
 }
@@ -622,12 +699,12 @@ impl<B: UsbBus> UsbClass<B> for CdcNcmClass<'_, B> {
                     debug!("ncm: REQ_SET_INTERFACE");
                     if req.value == 0 {
                         transfer.accept().ok();
-                        self.state = State::Disabled;
+                        self.state = DeviceState::Disabled;
                         info!("ncm: data interface disabled");
                         self.reset();
                     } else if req.value == 1 {
                         info!("ncm: data interface enabled");
-                        self.state = State::Enabled;
+                        self.state = DeviceState::Disconnected;
                         transfer.accept().ok();
                     } else {
                         warn!("SET_INTERFACE out of range {}", req.request);
@@ -651,10 +728,28 @@ impl<B: UsbBus> UsbClass<B> for CdcNcmClass<'_, B> {
     }
 
     fn endpoint_in_complete(&mut self, addr: EndpointAddress) {
-        if addr == self.comm_ep.address() && self.state == State::Connecting {
-            info!("ncm: connected");
-            self.state = State::Connected;
+        if addr != self.comm_ep.address() {
+            return;
         }
+
+        match self.request_state {
+            HostNotificationState::Complete => {
+                warn!("ncm: endpoint in completed when no request was in progress");
+            }
+            HostNotificationState::InProgress(HostNotification::Connect) => {
+                info!("ncm: connected");
+                self.state = DeviceState::Connected;
+            }
+            HostNotificationState::InProgress(HostNotification::Disconnect) => {
+                info!("ncm: disconnected");
+                self.state = DeviceState::Disconnected;
+            }
+            HostNotificationState::InProgress(HostNotification::Speed(cs)) => {
+                info!("ncm: connection speed set");
+                self.connection_speed = Some(cs);
+            }
+        }
+        self.request_state = HostNotificationState::Complete;
     }
 
     fn get_string(&self, index: StringIndex, _lang_id: u16) -> Option<&str> {
@@ -670,7 +765,9 @@ impl<B: UsbBus> UsbClass<B> for CdcNcmClass<'_, B> {
         info!("ncm: reset");
         self.ncm_in.reset();
         self.ncm_out.reset();
-        self.state = State::Disabled;
+        self.state = DeviceState::Disabled;
+        self.request_state = HostNotificationState::Complete;
+        self.connection_speed = None;
     }
 }
 
@@ -684,7 +781,10 @@ impl<'a, B: UsbBus> Device for CdcNcmClass<'a, B> {
         &mut self,
         _timestamp: smoltcp::time::Instant,
     ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        if self.state == State::Connected && self.ncm_in.can_write() && self.ncm_out.can_read() {
+        if self.state == DeviceState::Connected
+            && self.ncm_in.can_write()
+            && self.ncm_out.can_read()
+        {
             Some((
                 NcmRxToken::new(&mut self.ncm_out),
                 NcmTxToken::new(&mut self.ncm_in),
@@ -695,7 +795,7 @@ impl<'a, B: UsbBus> Device for CdcNcmClass<'a, B> {
     }
 
     fn transmit(&mut self, _timestamp: smoltcp::time::Instant) -> Option<Self::TxToken<'_>> {
-        if self.state == State::Connected && self.ncm_in.can_write() {
+        if self.state == DeviceState::Connected && self.ncm_in.can_write() {
             Some(NcmTxToken::new(&mut self.ncm_in))
         } else {
             None
