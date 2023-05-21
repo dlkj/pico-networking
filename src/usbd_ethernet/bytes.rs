@@ -33,30 +33,29 @@ pub(crate) trait Buf {
 
     fn get_slice(&mut self, size: usize) -> &[u8];
 
-    // Todo expose errors
-    fn get_u8(&mut self) -> u8 {
+    fn get_u8(&mut self) -> Option<u8> {
         const SIZE: usize = core::mem::size_of::<u8>();
-        let value = self.chunk().first().copied().unwrap();
+        let value = self.chunk().first().copied()?;
         self.advance(SIZE);
-        value
+        Some(value)
     }
 
-    // Todo expose errors
-    fn get_u16_le(&mut self) -> u16 {
+    fn get_u16_le(&mut self) -> Option<u16> {
         const SIZE: usize = core::mem::size_of::<u16>();
-        let int_bytes = self.chunk().get(..SIZE).unwrap();
+        let int_bytes = self.chunk().get(..SIZE)?;
+        // panic safety, will never fail
         let value = u16::from_le_bytes(int_bytes.try_into().unwrap());
         self.advance(SIZE);
-        value
+        Some(value)
     }
 
-    // Todo expose errors
-    fn get_u32_le(&mut self) -> u32 {
+    fn get_u32_le(&mut self) -> Option<u32> {
         const SIZE: usize = core::mem::size_of::<u32>();
-        let int_bytes = self.chunk().get(..SIZE).unwrap();
+        let int_bytes = self.chunk().get(..SIZE)?;
+        // panic safety, will never fail
         let value = u32::from_le_bytes(int_bytes.try_into().unwrap());
         self.advance(SIZE);
-        value
+        Some(value)
     }
 }
 

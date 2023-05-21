@@ -68,16 +68,14 @@ impl<'a, const LEN: usize> RWBuffer<'a, LEN> {
         len: usize,
         f: impl FnOnce(&mut [u8]) -> Result<(usize, R)>,
     ) -> Result<(usize, R)> {
-        // Todo combine with unwrap below
-        if len > self.unread() {
-            error!("buffer: tried to read more data than available");
-            return Err(UsbError::InvalidState);
-        }
-
-        let buf = self
+        let Some(buf) = self
             .store
             .get_mut(self.read_ptr..self.read_ptr + len)
-            .unwrap();
+            else
+            {
+                error!("buffer: tried to read more data than available");
+                return Err(UsbError::InvalidState);
+            };
 
         let (read, r) = f(buf)?;
         if read > len {
