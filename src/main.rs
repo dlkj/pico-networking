@@ -241,6 +241,7 @@ Content-Type: text/html
 <html><body>Hello pico!</body></html>",
                         )
                         .unwrap();
+                    socket.close();
                 }
 
                 Some(HttpRequest::Unknown) => {
@@ -253,6 +254,7 @@ Content-Length: 0
 ",
                         )
                         .unwrap();
+                    socket.close();
                 }
                 Some(HttpRequest::ClientError) => {
                     socket
@@ -264,6 +266,7 @@ Content-Length: 0
 ",
                         )
                         .unwrap();
+                    socket.close();
                 }
                 None => {}
             }
