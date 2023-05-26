@@ -18,6 +18,8 @@ use hal::{clocks::init_clocks_and_plls, pac, watchdog::Watchdog};
 use heapless::Vec;
 use panic_probe as _;
 use rp_pico as bsp;
+use smoltcp::socket::dhcpv4::RetryConfig;
+use smoltcp::time::Duration;
 use smoltcp::wire::DhcpOption;
 use smoltcp::{
     iface::{Config, Interface, SocketSet},
@@ -28,12 +30,14 @@ use smoltcp::{
 #[allow(clippy::wildcard_imports)]
 use usb_device::class_prelude::*;
 use usb_device::prelude::*;
+use web_server::WebServer;
 
 use crate::usbd_ethernet::cdc_ncm::CdcNcmClass;
 use crate::usbd_ethernet::cdc_ncm::DeviceState;
 use crate::usbd_ethernet::cdc_ncm::USB_CLASS_CDC;
 
 mod usbd_ethernet;
+mod web_server;
 
 const HOST_MAC_ADDR: [u8; 6] = [0x88, 0x88, 0x88, 0x88, 0x88, 0x88];
 const DEVICE_MAC_ADDR: [u8; 6] = [0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC];
@@ -50,6 +54,7 @@ fn main() -> ! {
     static mut TELNET_BUFFER: Vec<u8, 1024> = Vec::new();
 
     let mut pac = pac::Peripherals::take().unwrap();
+
     let mut watchdog = Watchdog::new(pac.WATCHDOG);
     let timer = Timer::new(pac.TIMER, &mut pac.RESETS);
     let ring_oscillator = RingOscillator::new(pac.ROSC);
@@ -98,7 +103,10 @@ fn main() -> ! {
 
     // Create sockets
     let mut dhcp_socket = dhcpv4::Socket::new();
-
+    dhcp_socket.set_retry_config(RetryConfig {
+        discover_timeout: Duration::from_secs(5),
+        ..RetryConfig::default()
+    });
     // register hostname with dhcp
     dhcp_socket.set_outgoing_options(&[DhcpOption {
         kind: 12, // Host Name
@@ -119,6 +127,8 @@ fn main() -> ! {
     let telnet_handle = sockets.add(telnet_socket);
     let http_handle = sockets.add(http_socket);
     let dhcp_handle = sockets.add(dhcp_socket);
+
+    let mut web_server = WebServer::new(http_handle);
 
     loop {
         if usb_dev.poll(&mut [&mut cdc_ncm]) && cdc_ncm.state() == DeviceState::Disconnected {
@@ -142,8 +152,9 @@ fn main() -> ! {
                 Instant::from_micros(i64::try_from(timer.get_counter().ticks()).unwrap());
 
             if interface.poll(timestamp, &mut cdc_ncm, &mut sockets) {
-                telnet_poll(sockets.get_mut::<tcp::Socket>(telnet_handle), TELNET_BUFFER);
-                http_poll(sockets.get_mut::<tcp::Socket>(http_handle));
+                let telnet_socket = sockets.get_mut::<tcp::Socket>(telnet_handle);
+                telnet_poll(telnet_socket, TELNET_BUFFER);
+                web_server.poll(|handle| sockets.get_mut(handle));
                 dhcp_poll(
                     &mut interface,
                     sockets.get_mut::<dhcpv4::Socket>(dhcp_handle),
@@ -189,90 +200,6 @@ fn telnet_poll<const LEN: usize>(socket: &mut tcp::Socket, buffer: &mut Vec<u8, 
         }
     } else if socket.may_send() {
         debug!("telnet: socket close");
-        socket.close();
-    }
-}
-
-enum HttpRequest {
-    Get,
-    Unknown,
-    ClientError,
-}
-
-fn http_poll(socket: &mut tcp::Socket) {
-    if !socket.is_open() {
-        socket.listen(80).unwrap();
-        debug!("http: listening on 80");
-    }
-
-    if socket.may_recv() {
-        let request = socket
-            .recv(|buffer| {
-                let request = if buffer.is_empty() {
-                    None
-                } else if let Ok(s) = from_utf8(buffer) {
-                    debug!("http: recv data: {:?}", s);
-
-                    if s.starts_with("GET / HTTP/1.1") {
-                        debug!("http: recv get /");
-                        Some(HttpRequest::Get)
-                    } else {
-                        debug!("http: recv unknown");
-                        Some(HttpRequest::Unknown)
-                    }
-                } else {
-                    debug!("http: recv data: {:?}", buffer);
-                    Some(HttpRequest::ClientError)
-                };
-                (buffer.len(), request)
-            })
-            .unwrap();
-        if socket.can_send() && request.is_some() {
-            match request {
-                Some(HttpRequest::Get) => {
-                    socket
-                        .send_slice(
-                            b"HTTP/1.1 200 OK
-Connection: close
-Content-Length: 53
-Content-Type: text/html
-
-<!DOCTYPE html>
-<html><body>Hello pico!</body></html>",
-                        )
-                        .unwrap();
-                    socket.close();
-                }
-
-                Some(HttpRequest::Unknown) => {
-                    socket
-                        .send_slice(
-                            b"HTTP/1.1 404 Not Found
-Connection: close
-Content-Length: 0
-
-",
-                        )
-                        .unwrap();
-                    socket.close();
-                }
-                Some(HttpRequest::ClientError) => {
-                    socket
-                        .send_slice(
-                            b"HTTP/1.1 400 Bad Request
-Connection: close
-Content-Length: 0
-
-",
-                        )
-                        .unwrap();
-                    socket.close();
-                }
-                None => {}
-            }
-        }
-    } else if socket.may_send() {
-        debug!("http: socket close");
         socket.close();
     }
 }
