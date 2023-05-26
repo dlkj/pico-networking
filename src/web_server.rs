@@ -1,7 +1,7 @@
 use core::fmt::Write;
 use core::str::from_utf8;
 use defmt::debug;
-use heapless::String;
+use embedded_hal::digital::v2::ToggleableOutputPin;
 use heapless::Vec;
 use smoltcp::{iface::SocketHandle, socket::tcp::Socket};
 
@@ -17,16 +17,22 @@ enum HttpResponse {
     NotFound,
 }
 
-pub(crate) struct WebServer {
+pub(crate) struct WebServer<'a, P: ToggleableOutputPin> {
     socket_handle: SocketHandle,
+    pin: P,
+    buffer: &'a mut Vec<u8, 512>,
 }
 
-impl WebServer {
-    pub fn new(socket_handle: SocketHandle) -> Self {
-        Self { socket_handle }
+impl<'a, P: ToggleableOutputPin> WebServer<'a, P> {
+    pub fn new(socket_handle: SocketHandle, pin: P, buffer: &'a mut Vec<u8, 512>) -> Self {
+        Self {
+            socket_handle,
+            pin,
+            buffer,
+        }
     }
 
-    pub fn poll<'a, 'b: 'a>(&mut self, f: impl FnOnce(SocketHandle) -> &'a mut Socket<'b>) {
+    pub fn poll<'b, 'c: 'b>(&mut self, f: impl FnOnce(SocketHandle) -> &'b mut Socket<'c>) {
         let socket = f(self.socket_handle);
         if !socket.is_open() {
             socket.listen(80).unwrap();
@@ -39,8 +45,8 @@ impl WebServer {
                 .unwrap();
 
             if let Some(request) = request {
-                let mut content: Vec<u8, 256> = Vec::new();
-                let r = response(&request, &mut content);
+                self.buffer.clear();
+                let r = response(&request, self.buffer, &mut self.pin);
 
                 match r {
                     HttpResponse::Ok => socket.send_slice(b"HTTP/1.1 200 OK\n"),
@@ -49,17 +55,14 @@ impl WebServer {
                 }
                 .unwrap();
 
-                let mut response: String<256> = String::new();
                 write!(
-                    response,
-                    "Connection: close
-Content-Type: text/html
+                    socket,
+                    "Content-Type: text/html
 Content-Length: {}\n\n",
-                    content.len()
+                    self.buffer.len()
                 )
                 .unwrap();
-                socket.send_slice(response.as_bytes()).unwrap();
-                socket.send_slice(content.as_slice()).unwrap();
+                socket.send_slice(self.buffer).unwrap();
                 socket.close();
             }
         } else if socket.may_send() && !socket.may_recv() {
@@ -69,15 +72,20 @@ Content-Length: {}\n\n",
     }
 }
 
-fn response(request: &HttpRequest, content: &mut Vec<u8, 256>) -> HttpResponse {
+fn response(
+    request: &HttpRequest,
+    content: &mut Vec<u8, 512>,
+    led: &mut impl ToggleableOutputPin,
+) -> HttpResponse {
     match request {
         HttpRequest::Get => {
-            content
-                .extend_from_slice(
-                    b"<!DOCTYPE html>
-<html><body><h1>Hello pico!</h1><p>This is some <i>html</i>!</p></body></html>",
-                )
-                .unwrap();
+            write!(
+                content,
+                "<!DOCTYPE html>
+<html><body><h1>Hello pico!</h1><p>This is some <i>html</i>!</p></body></html>"
+            )
+            .unwrap();
+            led.toggle().ok().unwrap();
             HttpResponse::Ok
         }
 

@@ -44,6 +44,7 @@ const DEVICE_MAC_ADDR: [u8; 6] = [0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC];
 const HOST_NAME: &[u8] = b"pico";
 
 #[entry]
+#[allow(clippy::too_many_arguments)]
 fn main() -> ! {
     static mut TELNET_SOCKET_RX_DATA: [u8; 1024] = [0; 1024];
     static mut TELNET_SOCKET_TX_DATA: [u8; 1024] = [0; 1024];
@@ -51,14 +52,23 @@ fn main() -> ! {
     static mut HTTP_SOCKET_TX_DATA: [u8; 1024] = [0; 1024];
     static mut NCM_IN_BUFFER: [u8; 2048] = [0; 2048];
     static mut NCM_OUT_BUFFER: [u8; 2048] = [0; 2048];
-    static mut TELNET_BUFFER: Vec<u8, 1024> = Vec::new();
+    static mut TELNET_BUFFER: Vec<u8, 512> = Vec::new();
+    static mut WEB_SERVER_BUFFER: Vec<u8, 512> = Vec::new();
 
     let mut pac = pac::Peripherals::take().unwrap();
 
     let mut watchdog = Watchdog::new(pac.WATCHDOG);
     let timer = Timer::new(pac.TIMER, &mut pac.RESETS);
     let ring_oscillator = RingOscillator::new(pac.ROSC);
+    let sio = hal::Sio::new(pac.SIO);
 
+    // Set the pins up according to their function on this particular board
+    let pins = rp_pico::Pins::new(
+        pac.IO_BANK0,
+        pac.PADS_BANK0,
+        sio.gpio_bank0,
+        &mut pac.RESETS,
+    );
     let clocks = init_clocks_and_plls(
         bsp::XOSC_CRYSTAL_FREQ,
         pac.XOSC,
@@ -70,6 +80,8 @@ fn main() -> ! {
     )
     .ok()
     .unwrap();
+
+    let led_pin = pins.led.into_push_pull_output();
 
     let usb_bus = hal::usb::UsbBus::new(
         pac.USBCTRL_REGS,
@@ -128,23 +140,10 @@ fn main() -> ! {
     let http_handle = sockets.add(http_socket);
     let dhcp_handle = sockets.add(dhcp_socket);
 
-    let mut web_server = WebServer::new(http_handle);
+    let mut web_server = WebServer::new(http_handle, led_pin, WEB_SERVER_BUFFER);
 
     loop {
-        if usb_dev.poll(&mut [&mut cdc_ncm]) && cdc_ncm.state() == DeviceState::Disconnected {
-            if cdc_ncm.connection_speed().is_none() {
-                // 1000 Kps upload and download
-                match cdc_ncm.set_connection_speed(1_000_000, 1_000_000) {
-                    Ok(_) | Err(UsbError::WouldBlock) => {}
-                    Err(e) => error!("Failed to set connection speed: {}", e),
-                }
-            } else {
-                match cdc_ncm.connect() {
-                    Ok(_) | Err(UsbError::WouldBlock) => {}
-                    Err(e) => error!("Failed to connect: {}", e),
-                }
-            }
-        }
+        usb_poll(&mut usb_dev, &mut cdc_ncm);
 
         if cdc_ncm.state() == DeviceState::Connected {
             // panic safety - will take 292_277 years to overflow at one tick per microsecond
@@ -159,6 +158,23 @@ fn main() -> ! {
                     &mut interface,
                     sockets.get_mut::<dhcpv4::Socket>(dhcp_handle),
                 );
+            }
+        }
+    }
+}
+
+fn usb_poll<B: UsbBus>(usb_dev: &mut UsbDevice<B>, cdc_ncm: &mut CdcNcmClass<B>) {
+    if usb_dev.poll(&mut [cdc_ncm]) && cdc_ncm.state() == DeviceState::Disconnected {
+        if cdc_ncm.connection_speed().is_none() {
+            // 1000 Kps upload and download
+            match cdc_ncm.set_connection_speed(1_000_000, 1_000_000) {
+                Ok(_) | Err(UsbError::WouldBlock) => {}
+                Err(e) => error!("Failed to set connection speed: {}", e),
+            }
+        } else {
+            match cdc_ncm.connect() {
+                Ok(_) | Err(UsbError::WouldBlock) => {}
+                Err(e) => error!("Failed to connect: {}", e),
             }
         }
     }

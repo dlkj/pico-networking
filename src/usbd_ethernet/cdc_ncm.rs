@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use super::buffer::RWBuffer;
 use super::bytes::{Buf, BufMut};
 use defmt::{debug, error, info, warn, Format};
@@ -120,6 +122,7 @@ impl<'a, B: UsbBus> CdcNcmClass<'a, B> {
     pub fn connect(&mut self) -> Result<()> {
         self.network_connection_notification(true)
     }
+
 
     pub fn disconnect(&mut self) -> Result<()> {
         self.network_connection_notification(false)
