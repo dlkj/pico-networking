@@ -33,9 +33,7 @@ smoltcp = { version = "0.9.1", default-features = false, features = [
     "proto-ipv4",
     "proto-ipv6",
 ] }
-rp-pico = { path = "../rp-hal-boards/boards/rp-pico", features = [
-    "rom-v2-intrinsics",
-] }
+rp-pico = { version = "0.7", features = ["rom-v2-intrinsics"] }
 
 
 # cargo build/run
