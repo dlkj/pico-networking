@@ -123,7 +123,6 @@ impl<'a, B: UsbBus> CdcNcmClass<'a, B> {
         self.network_connection_notification(true)
     }
 
-
     pub fn disconnect(&mut self) -> Result<()> {
         self.network_connection_notification(false)
     }
@@ -403,7 +402,7 @@ impl<'a, B: UsbBus> NcmOut<'a, B> {
             let Some(ndp_idx) = data.get_u16_le().map(usize::from)
             else{
                 warn!("ncm: NTH too short, unable to read ndp_idx");
-                return Err(UsbError::ParseError);     
+                return Err(UsbError::ParseError);
             };
             assert!(!data.has_remaining());
             Ok((NTB_HEADER_LEN, ndp_idx - NTB_HEADER_LEN))
@@ -441,12 +440,12 @@ impl<'a, B: UsbBus> NcmOut<'a, B> {
             let Some(datagram_index) = ntb_datagram_pointer.get_u16_le().map(usize::from)
             else{
                 warn!("ncm: NTB too short, unable to read datagram_index");
-                return Err(UsbError::ParseError);     
+                return Err(UsbError::ParseError);
             };
             let Some(datagram_len) = ntb_datagram_pointer.get_u16_le().map(usize::from)
             else{
                 warn!("ncm: NTB too short, unable to read datagram_len");
-                return Err(UsbError::ParseError);     
+                return Err(UsbError::ParseError);
             };
 
             if datagram_index == 0 || datagram_len == 0 {
@@ -689,21 +688,17 @@ impl<B: UsbBus> UsbClass<B> for CdcNcmClass<'_, B> {
                     debug!("ncm: REQ_SET_NTB_INPUT_SIZE");
                     // We only support the minimum NTB maximum size the value
                     // will always be NTB_MAX_SIZE
-                    if let Some(ntb_input_size) = transfer.data().get_u32_le()
-                    {
+                    if let Some(ntb_input_size) = transfer.data().get_u32_le() {
                         if ntb_input_size != NTB_MAX_SIZE {
                             warn!(
                                 "ncp: unexpected REQ_SET_NTB_INPUT_SIZE data {}",
                                 transfer.data()
                             );
                         }
-                    }
-                    else{
-                        warn!(
-                            "ncp: unexpected REQ_SET_NTB_INPUT_SIZE data too short"
-                        );
+                    } else {
+                        warn!("ncp: unexpected REQ_SET_NTB_INPUT_SIZE data too short");
                     };
-                    
+
                     let _: Result<()> = transfer.accept();
                 }
                 _ => {
