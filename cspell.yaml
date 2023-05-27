@@ -15,6 +15,7 @@ words:
   - iface
   - NCMH
   - notif
+  - onclick
   - pico
   - plls
   - println
